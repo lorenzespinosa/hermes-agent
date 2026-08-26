@@ -10255,11 +10255,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Message storage
     # =========================================================================
 
-    # Sentinel prefix used to distinguish JSON-encoded structured content
-    # (multimodal messages: lists of parts like text + image_url) from plain
-    # string content. The NUL byte is not legal in normal text, so this
-    # cannot collide with real user content.
+    # Legacy structured-content marker. Rows written before the v2 envelope
+    # must remain readable, but new writes never use this ambiguous shape: a
+    # perfectly valid user string may begin with the same bytes.
     _CONTENT_JSON_PREFIX = "\x00json:"
+
+    # New structured content and collision-prone strings use a versioned,
+    # typed envelope. Ordinary strings stay raw so SQL text search/equality
+    # and FTS continue to operate on their historical storage representation.
+    # A literal string beginning with either marker is itself enveloped as a
+    # string, so even valid/invalid sentinel-prefixed text is unambiguous.
+    _CONTENT_ENVELOPE_PREFIX = "\x00hermes-content-envelope:"
+    _CONTENT_ENVELOPE_VERSION = 2
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
@@ -10271,9 +10278,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         raises ``ProgrammingError: Error binding parameter N: type 'list' is
         not supported`` when bound directly.
 
-        Returns the value unchanged when it's already a safe scalar, or a
-        sentinel-prefixed JSON string for lists/dicts. Paired with
-        :meth:`_decode_content` on read.
+        Ordinary strings and safe scalars retain their historical storage
+        shape. Lists/dicts and strings beginning with an encoding marker use
+        a versioned typed envelope, so a string can never be mistaken for
+        structured content. Paired with :meth:`_decode_content` on read.
         """
         if isinstance(content, str):
             # Lone UTF-16 surrogates reach here inside tool results scraped
@@ -10285,20 +10293,68 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # land. Left raw, sqlite3 raises UnicodeEncodeError, the flush is
             # abandoned, and the session silently stops persisting for the
             # rest of its life. Scrub so persistence never fails.
-            return _sanitize_surrogates(content)
+            sanitized = _sanitize_surrogates(content)
+            if sanitized.startswith(
+                (cls._CONTENT_JSON_PREFIX, cls._CONTENT_ENVELOPE_PREFIX)
+            ):
+                envelope = {
+                    "version": cls._CONTENT_ENVELOPE_VERSION,
+                    "type": "string",
+                    "value": sanitized,
+                }
+                return cls._CONTENT_ENVELOPE_PREFIX + json.dumps(
+                    envelope, ensure_ascii=True, separators=(",", ":")
+                )
+            return sanitized
         if content is None or isinstance(content, (bytes, int, float)):
             return content
         try:
             # json.dumps defaults to ensure_ascii=True, which escapes any
             # surrogate as \udXXX — already safe to bind.
-            return cls._CONTENT_JSON_PREFIX + json.dumps(content)
+            envelope = {
+                "version": cls._CONTENT_ENVELOPE_VERSION,
+                "type": "structured",
+                "value": content,
+            }
+            return cls._CONTENT_ENVELOPE_PREFIX + json.dumps(
+                envelope, ensure_ascii=True, separators=(",", ":")
+            )
         except (TypeError, ValueError):
             # Last-resort fallback: stringify so persistence never fails.
-            return _sanitize_surrogates(str(content))
+            return cls._encode_content(_sanitize_surrogates(str(content)))
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
         """Reverse :meth:`_encode_content`; returns scalars unchanged."""
+        if isinstance(content, str) and content.startswith(
+            cls._CONTENT_ENVELOPE_PREFIX
+        ):
+            try:
+                envelope = json.loads(
+                    content[len(cls._CONTENT_ENVELOPE_PREFIX):]
+                )
+            except (json.JSONDecodeError, TypeError):
+                envelope = None
+            if isinstance(envelope, dict) and (
+                envelope.get("version") == cls._CONTENT_ENVELOPE_VERSION
+            ):
+                envelope_type = envelope.get("type")
+                value = envelope.get("value")
+                if envelope_type == "string" and isinstance(value, str):
+                    return value
+                if envelope_type == "structured" and isinstance(
+                    value, (list, dict)
+                ):
+                    return value
+            logger.warning(
+                "Failed to decode versioned message-content envelope; "
+                "returning raw string"
+            )
+            return content
+
+        # Compatibility for structured rows written by the old NUL-json
+        # encoder. Invalid legacy-prefixed text was historically returned raw
+        # and remains byte-for-byte unchanged.
         if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
             try:
                 return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
@@ -10514,7 +10570,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
-        api_content: Optional[str] = None,
+        api_content: Optional[Any] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
@@ -10533,7 +10589,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
 
-        ``api_content`` is the exact content string sent to the API for this
+        ``api_content`` is the exact string or structured content sent to the API for this
         message when it differs from ``content`` (ephemeral memory/plugin
         injections, persist overrides).  It is a byte-fidelity sidecar for
         prompt-cache-stable replay — stored as sent, except lone surrogates
@@ -10560,6 +10616,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
+        stored_api_content = self._encode_content(api_content)
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -10609,7 +10666,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     platform_message_id,
                     1 if observed else 0,
                     1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    stored_api_content,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
                 ),
@@ -11040,7 +11097,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    self._encode_content(api_content),
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
@@ -11350,7 +11407,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return cols
 
     def set_latest_user_api_content(
-        self, session_id: str, content: Any, api_content: str
+        self, session_id: str, content: Any, api_content: Any
     ) -> int:
         """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row.
 
@@ -11375,7 +11432,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE session_id = ? AND role = 'user' AND active = 1 "
                 "ORDER BY id DESC LIMIT 1"
                 ") AND content IS ?",
-                (_scrub_surrogates(api_content), session_id, encoded),
+                (self._encode_content(api_content), session_id, encoded),
             )
             return cursor.rowcount
 
@@ -11517,6 +11574,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             msg = dict(row)
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
+            if msg.get("api_content") is not None:
+                msg["api_content"] = self._decode_content(msg["api_content"])
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -11611,6 +11670,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             msg = dict(row)
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
+            if msg.get("api_content") is not None:
+                msg["api_content"] = self._decode_content(msg["api_content"])
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -11840,14 +11901,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # strips it before the wire.
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
-            # api_content is the byte-fidelity sidecar: the exact string sent
+            # api_content is the byte-fidelity sidecar: the exact content sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay
             # path substitutes it for content to keep the provider prompt
             # cache prefix byte-stable across turns. Cleaning it here would
             # re-introduce the divergence it exists to remove.
-            if row["api_content"]:
-                msg["api_content"] = row["api_content"]
+            if row["api_content"] is not None:
+                msg["api_content"] = self._decode_content(row["api_content"])
             if row["display_kind"]:
                 msg["display_kind"] = row["display_kind"]
             if row["display_metadata"]:

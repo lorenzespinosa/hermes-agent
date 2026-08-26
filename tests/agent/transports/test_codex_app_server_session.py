@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -506,6 +507,93 @@ class TestCompactThread:
 
 class TestServerRequestRouting:
 
+    @pytest.mark.parametrize(
+        "request_method, request_params",
+        [
+            (
+                "item/commandExecution/requestApproval",
+                {"command": "echo guarded", "cwd": "/tmp"},
+            ),
+            (
+                "item/fileChange/requestApproval",
+                {
+                    "itemId": "file-change-1",
+                    "turnId": "tu1",
+                    "threadId": "t",
+                    "reason": "edit guarded file",
+                },
+            ),
+        ],
+        ids=["exec", "apply-patch"],
+    )
+    @pytest.mark.parametrize("afk_timing", ["before-presentation", "mid-prompt"])
+    def test_codex_approval_obeys_afk_presentation_and_finalization(
+        self,
+        tmp_path,
+        monkeypatch,
+        request_method,
+        request_params,
+        afk_timing,
+    ):
+        from agent import afk
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        client = FakeClient()
+        client.queue_server_request(
+            request_method,
+            request_id="afk-codex-request",
+            **request_params,
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        callback_count = 0
+
+        def cb(*_args, **_kwargs):
+            nonlocal callback_count
+            callback_count += 1
+            callback_entered.set()
+            assert release_callback.wait(timeout=5)
+            return "once"
+
+        session = make_session(client, approval_callback=cb)
+        outcome = {}
+        done = threading.Event()
+
+        def run():
+            try:
+                outcome["result"] = session.run_turn("test", turn_timeout=1.0)
+            except BaseException as exc:  # pragma: no cover - failure detail
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        try:
+            if afk_timing == "before-presentation":
+                afk.engage(reason="already away")
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            if afk_timing == "mid-prompt":
+                assert callback_entered.wait(timeout=5)
+                afk.engage(reason="Codex prompt still open")
+                release_callback.set()
+
+            assert done.wait(timeout=5)
+            thread.join(timeout=1)
+            assert "error" not in outcome, outcome.get("error")
+            assert callback_count == (1 if afk_timing == "mid-prompt" else 0)
+            assert (
+                "afk-codex-request",
+                {"decision": "decline"},
+            ) in client.responses
+        finally:
+            release_callback.set()
+            session.close()
+
 
 
     def test_unknown_server_request_replied_with_error(self):
@@ -895,4 +983,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

@@ -26,7 +26,7 @@ See the per-platform docs for examples — the structure is identical across pla
 - [Mattermost](../user-guide/messaging/mattermost.md)
 - [Signal](../user-guide/messaging/signal.md)
 
-If `allow_admin_from` is unset for a scope, that scope stays in unrestricted backward-compat mode — every allowed user can run every command.
+If `allow_admin_from` is unset for a scope, that scope stays in unrestricted backward-compat mode — every allowed user can run every command — **except `/afk`**. AFK is machine-global, so messaging mutation is always admin-only: `!afk`/`/afk` requires the caller's ID in `allow_admin_from` for a DM or `group_allow_admin_from` for a group, channel, or thread. Listing `afk` in `user_allowed_commands` does not grant it.
 
 ## Interactive CLI slash commands
 
@@ -49,6 +49,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/diff [staged\|all\|session] [--stat] [path...]` | Show git changes in the working directory. Default: unstaged changes plus untracked files. `staged` shows what's staged for commit, `all` everything since HEAD, and `session` the cumulative diff of everything Hermes changed here (from the earliest retained checkpoint baseline — requires checkpoints to be enabled; complements `/rollback diff <N>`). `--stat` prints just the changed-file summary; path arguments restrict the diff. |
 | `/snapshot [create\|restore <id>\|prune]` (alias: `/snap`) | Create or restore state snapshots of Hermes config/state. `create [label]` saves a snapshot, `restore <id>` reverts to it, `prune [N]` removes old snapshots, or list all with no args. |
 | `/stop` | Kill all running background processes |
+| `/afk [on [reason] \| off \| status]` | Set, clear, or inspect the machine-global AFK status. Uses the same closed grammar as messaging and the TUI; see [What AFK does](#what-afk-does). |
 | `/queue <prompt>` (alias: `/q`) | Queue a prompt for the next turn (doesn't interrupt the current agent response). |
 | `/steer <prompt>` | Inject a mid-run note that arrives at the agent **after the next tool call** — no interrupt, no new user turn. The text is appended to the last tool result's content once the current tool completes, giving the agent new context without breaking the current tool-calling loop. Use this to nudge direction mid-task (e.g. "focus on the auth module" while the agent is running tests). |
 | `/goal <text>` | Set a standing goal Hermes works toward across turns — our take on the Ralph loop. After each turn an auxiliary judge model decides whether the goal is done; if not, Hermes auto-continues. Subcommands: `/goal status`, `/goal pause`, `/goal resume`, `/goal clear`. Budget defaults to 20 turns (`goals.max_turns`); any real user message preempts the continuation loop, and state survives `/resume`. See [Persistent Goals](/user-guide/features/goals) for the full walkthrough. |
@@ -220,7 +221,7 @@ Commands support prefix matching: typing `/h` resolves to `/help`, `/mod` resolv
 ## Messaging slash commands
 
 > **Slack thread commands (`!` prefix):**
-> Slack itself blocks native slash commands inside message threads ("/queue is not supported in threads. Sorry!") and never delivers them to Hermes. Inside a Slack thread, use the `!` prefix instead — `!stop`, `!new`, `!status` — and the gateway dispatches it exactly like the slash form. `@Hermes !stop` and `@Hermes /stop` work in threads too. Only the first token is checked against the known command list, so messages like `!nice work` pass through to the agent unchanged. See [Using commands inside threads](/user-guide/messaging/slack#using-commands-inside-threads-the-cmd-prefix) for details.
+> Slack itself blocks native slash commands inside message threads ("/queue is not supported in threads. Sorry!") and never delivers them to Hermes. Inside a Slack thread, use the `!` prefix instead — `!stop`, `!new`, `!status`, `!afk` — and the gateway dispatches it exactly like the slash form. `@Hermes !stop` and `@Hermes /stop` work in threads too. Only the first token is checked against the known command list, so messages like `!nice work` pass through to the agent unchanged. See [Using commands inside threads](/user-guide/messaging/slack#using-commands-inside-threads-the-cmd-prefix) for details.
 
 The messaging gateway supports the following built-in commands inside Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant, and Teams chats:
 
@@ -230,6 +231,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/new [name]` (alias: `/reset`) | Start a new session (fresh session ID + history). Optional `[name]` sets the initial session title. Append `now`, `--yes`, or `-y` to skip the confirmation modal — e.g. `/reset now`, `/new --yes my-experiment`. |
 | `/status` | Show session info, followed by a local **Session recap** block (recent turn counts, top tools used, files touched, latest prompt + reply). |
 | `/stop` | Kill all running background processes and interrupt the running agent. |
+| `/afk [on [reason] \| off \| status]` | Mark yourself away from the keyboard. Bare `/afk` and `/afk on [reason]` engage; `/afk off` (also `back`, `return`) clears it; `/afk status` reports the exact current state. Anything else prints usage and changes nothing. Safe to run mid-turn. Messaging callers must be explicitly listed in `allow_admin_from` (DM) or `group_allow_admin_from` (group/channel/thread), even when legacy slash gating is otherwise disabled. **On Slack:** use `!afk` / `!afk on lunch` / `!afk off` inside threads, and `/hermes afk …` elsewhere. |
 | `/model [provider:model]` | Show or change the model. Supports provider switches (`/model zai:glm-5`), custom endpoints (`/model custom:model`), named custom providers (`/model custom:local:qwen`), auto-detect (`/model custom`), and user-defined aliases (`/model fav`, `/model grok` — see [Custom model aliases](#custom-model-aliases)). Use `--global` to persist the change to config.yaml. **Note:** `/model` can only switch between already-configured providers. To add a new provider or set up API keys, use `hermes model` from your terminal (outside the chat session). **Cost note:** a mid-session model switch resets the prompt cache (the cache key includes the model), so the next message re-reads the whole conversation at full input price. |
 | `/codex-runtime [auto\|codex_app_server\|on\|off]` | Toggle the optional [Codex app-server runtime](../user-guide/features/codex-app-server-runtime). Persists to `model.openai_runtime` in config.yaml and evicts the cached agent so the next message picks up the new runtime. Effective on next session. |
 | `/personality [name]` | Set a personality overlay for the session. `/personality none` (or `default` / `neutral`) clears it. |
@@ -288,6 +290,20 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/help` | Show messaging help. |
 | `/<skill-name>` | Invoke any installed skill by name. |
 
+## What AFK does
+
+`/afk` records that **you** — the person who owns this Hermes — have stepped away. It changes three things and nothing else.
+
+**1. Every session on the machine sees it, including other profiles.** The state is one record at the default Hermes *root* (`~/.hermes/afk.json`; `%LOCALAPPDATA%\hermes\afk.json` on native Windows), resolved by `get_default_hermes_root()` rather than the active profile home. `/afk` typed in your work profile is visible from your personal profile, the CLI, API, TUI/desktop, cron, ACP, and every gateway session. The local CLI/TUI or an explicitly authorized gateway admin can clear it. This is a deliberate exception to the "profiles are independent islands" rule: availability is a fact about you, not about a Hermes instance. It survives a gateway restart. If the default root cannot be resolved, writes fail closed instead of falling back to a second `~/.hermes` location.
+
+**2. Approval prompts fail closed on every interactive surface — you are never pinged, and nothing is auto-approved.** While you're AFK, a new approval request is denied before its notification callback runs. Engaging AFK also denies and signals approvals already waiting in messaging, API, TUI/desktop, or ACP queues, so their tool threads unblock immediately. A stale button or API response received while AFK cannot grant once/session/always approval. The agent receives an automatic-AFK explanation, not the false claim that the user denied it. Absence is never consent.
+
+**3. Turns on every conversation surface are told you're away — status only.** The shared agent turn prologue reads AFK fresh for CLI, API, TUI/desktop, ACP, cron, and messaging. String turns use the API-bound `api_content` sidecar so historical bytes remain prompt-cache stable. Multimodal turns append the note only to a deep-cloned outgoing API list; the stored image/text list is never mutated, so a cleared status cannot persist there. The system prompt and role/history structure are untouched. Nothing is added while you're available.
+
+**Your reason stays out of the model's context.** `/afk on picking up the kids` shows that text back to you in `/afk status` and in the confirmation, and it is stored bounded and neutralized. It is never included in the note sent to the model — the agent only needs to know *that* nobody is at the keyboard.
+
+**File permissions and symlinks.** On Linux and macOS the state file is written `0600` and verified after the write. State and lock symlink leaves are rejected; writes use a no-follow temporary file plus atomic replacement and never modify a symlink victim. Native Windows has no POSIX mode bits and Hermes installs no custom ACL there, so the only protection is the per-user `%LOCALAPPDATA%` location — Hermes does not claim owner-only permissions on Windows.
+
 ## Notes
 
 - `/skin`, `/snapshot`, `/export`, `/import`, `/reload`, `/tools`, `/toolsets`, `/browser`, `/config`, `/cron`, `/platforms`, `/paste`, `/image`, `/statusbar`, `/battery`, `/focus`, `/plugins`, `/busy`, `/indicator`, `/wake`, `/journey`, `/redraw`, `/clear`, `/history`, `/save`, `/copy`, `/handoff`, `/prompt`, `/pet`, `/hatch`, `/timestamps`, `/subscription`, and `/quit` are **CLI-only** commands.
@@ -295,7 +311,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 - `/verbose` is **CLI-only by default**, but can be enabled for messaging platforms by setting `display.tool_progress_command: true` in `config.yaml`. When enabled, it cycles the `display.tool_progress` mode and saves to config.
 - `/focus` and `/verbose` share one suppression path (`display.tool_progress`), so they can never contradict each other: `/focus on` pins tool progress to `off` and stashes your mode under `display.focus_saved_tool_progress`; `/focus off` restores it; cycling `/verbose` while focus is on takes the mode back and clears the focus badge. Focus view is display-only — it never changes conversation history, the system prompt, or anything sent to the model, so it has zero prompt-cache impact.
 - `/sethome`, `/restart`, `/approve`, `/deny`, `/topic`, `/platform`, and `/commands` are **messaging-only** commands.
-- `/status`, `/egress`, `/version`, `/whoami`, `/background`, `/queue`, `/steer`, `/voice`, `/reload-mcp`, `/reload-skills`, `/rollback`, `/diff`, `/debug`, `/fast`, `/approvals`, `/footer`, `/curator`, `/kanban`, `/topup`, `/suggestions`, `/blueprint`, `/learn`, `/init`, `/sessions`, and `/yolo` work in **both** the CLI and the messaging gateway.
+- `/status`, `/afk`, `/egress`, `/version`, `/whoami`, `/background`, `/queue`, `/steer`, `/voice`, `/reload-mcp`, `/reload-skills`, `/rollback`, `/diff`, `/debug`, `/fast`, `/approvals`, `/footer`, `/curator`, `/kanban`, `/topup`, `/suggestions`, `/blueprint`, `/learn`, `/init`, `/sessions`, and `/yolo` work in **both** the CLI and the messaging gateway; `/afk` is also available through the TUI slash worker.
 - `/voice join`, `/voice channel`, and `/voice leave` are only meaningful on Discord.
 - In the TUI, `/sessions` shows live sessions in the current TUI process. Use `/resume [name]` or `hermes --tui --resume <id-or-title>` for saved or closed transcripts.
 

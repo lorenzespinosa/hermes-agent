@@ -12418,6 +12418,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_import_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
+        elif canonical == "afk":
+            # Shared with gateway and the TUI slash worker. Keep parsing and
+            # mutation in agent.afk so every surface has one closed grammar
+            # and one machine-global state path.
+            from agent import afk
+
+            _afk_parts = cmd_original.split(None, 1)
+            _afk_args = _afk_parts[1] if len(_afk_parts) > 1 else ""
+            self._console_print(
+                afk.handle_command(_afk_args), highlight=False, markup=False
+            )
         elif canonical == "agents":
             self._handle_agents_command()
         elif canonical == "journey":

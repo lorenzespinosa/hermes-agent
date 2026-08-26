@@ -2778,10 +2778,26 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = (
+        "event",
+        "resolution_committed",
+        "data",
+        "result",
+        "reason",
+        "acknowledged",
+        "resolution_source",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
+        # ``event`` means a resolver has produced a provisional choice.
+        # Grants are not consumable until ``resolution_committed`` is set
+        # after the resolver's final machine-global AFK revalidation.
+        self.resolution_committed = threading.Event()
+        # Direct/internal event setters used by teardown and legacy callers
+        # already carry a final result. Only ``resolve_gateway_approval``
+        # clears this while its provisional user response is in flight.
+        self.resolution_committed.set()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
@@ -2790,6 +2806,11 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        # ``resolving`` while a user response awaits its final AFK check,
+        # ``user`` after that check, ``afk`` for availability enforcement, or
+        # None while pending/teardown. Result text must not misattribute an
+        # automatic denial to the human.
+        self.resolution_source: Optional[str] = None
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2818,7 +2839,197 @@ def unregister_gateway_notify(session_key: str) -> None:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
+        entry.resolution_committed.set()
         entry.event.set()
+
+
+def _deny_all_gateway_entries(reason: str, source: str) -> int:
+    """Drain every interactive queue with one automatic denial source."""
+    with _lock:
+        entries = [
+            entry
+            for queue in _gateway_queues.values()
+            for entry in queue
+        ]
+        _gateway_queues.clear()
+        for entry in entries:
+            entry.result = "deny"
+            entry.reason = reason
+            entry.resolution_source = source
+    for entry in entries:
+        entry.resolution_committed.set()
+        entry.event.set()
+    return len(entries)
+
+
+def deny_pending_approvals_for_afk() -> int:
+    """Deny and signal every queued interactive approval after AFK engages.
+
+    ``agent.afk.engage`` calls this while holding the shared AFK status
+    transaction. Fresh enqueue/notify and resolution paths take the same
+    transaction first, so the state transition, queue drain and event signals
+    form one race-free boundary rather than depending on polling sleeps.
+    """
+    from agent.afk import APPROVAL_DENY_REASON
+
+    return _deny_all_gateway_entries(APPROVAL_DENY_REASON, "afk")
+
+
+_PRESENTATION_AFK_DENIED_CHOICE = "afk_denied"
+_PRESENTATION_AVAILABILITY_DENIED_CHOICE = "availability_denied"
+
+
+def approval_presentation_denial() -> Optional[dict]:
+    """Return an automatic denial unless approval UI may be presented now.
+
+    This is the single fail-closed availability-before-presentation boundary
+    for every approval surface. ``None`` means the operator was verifiably
+    available at this check. A dict means no callback, notifier, transport,
+    or other prompt UI may be invoked; it carries the deterministic AFK or
+    unreadable-state reason used by the caller's normal blocked result.
+
+    This check deliberately does not replace final authorization
+    revalidation. AFK may legitimately commit after a prompt was presented
+    while the operator was available, in which case
+    :func:`_finalize_interactive_authorization` still withdraws the response
+    before execution or persistence.
+    """
+    from agent import afk
+
+    try:
+        with afk.status_transaction():
+            if not afk.is_afk():
+                return None
+            deny_pending_approvals_for_afk()
+            return {
+                "authorized": False,
+                "resolved": True,
+                "choice": "deny",
+                "reason": afk.APPROVAL_DENY_REASON,
+                "afk_denied": True,
+            }
+    except Exception:
+        logger.warning(
+            "Approval prompt suppressed because machine-global AFK status "
+            "could not be safely verified",
+            exc_info=True,
+        )
+        _deny_all_gateway_entries(
+            afk.APPROVAL_STATUS_UNKNOWN_REASON, "availability"
+        )
+        return {
+            "authorized": False,
+            "resolved": True,
+            "choice": "deny",
+            "reason": afk.APPROVAL_STATUS_UNKNOWN_REASON,
+            "availability_denied": True,
+        }
+
+
+def _presentation_denial_choice(decision: dict) -> str:
+    """Encode an automatic presentation denial in the string choice API."""
+    if decision.get("afk_denied"):
+        return _PRESENTATION_AFK_DENIED_CHOICE
+    return _PRESENTATION_AVAILABILITY_DENIED_CHOICE
+
+
+def approval_presentation_denial_for_choice(choice: str) -> Optional[dict]:
+    """Decode the two automatic-denial choices returned by local prompts."""
+    from agent import afk
+
+    if choice == _PRESENTATION_AFK_DENIED_CHOICE:
+        return {
+            "authorized": False,
+            "resolved": True,
+            "choice": "deny",
+            "reason": afk.APPROVAL_DENY_REASON,
+            "afk_denied": True,
+        }
+    if choice == _PRESENTATION_AVAILABILITY_DENIED_CHOICE:
+        return {
+            "authorized": False,
+            "resolved": True,
+            "choice": "deny",
+            "reason": afk.APPROVAL_STATUS_UNKNOWN_REASON,
+            "availability_denied": True,
+        }
+    return None
+
+
+def _enforce_current_availability_on_pending() -> bool:
+    """Synchronize pending queues with the machine-global AFK record.
+
+    Same-process transitions signal entries directly from ``engage()``.
+    Waiting processes also call this after each existing bounded event-wait
+    slice, so an AFK command issued by another process is observed under the
+    same cross-process status lock and cannot strand an approval until its
+    full timeout. No grant path relies on this polling: resolver grants always
+    take the status transaction themselves.
+    """
+    return approval_presentation_denial() is not None
+
+
+def _force_entries_denied(entries, reason: str, source: str) -> None:
+    """Make resolver-owned entries fail closed before waking their waiters."""
+    with _lock:
+        for entry in entries:
+            entry.result = "deny"
+            entry.reason = reason
+            entry.resolution_source = source
+
+
+def _finalize_interactive_authorization(choice: str, persist=None) -> dict:
+    """Commit one interactive grant under the machine-global AFK ordering.
+
+    Every callback/transport route calls this immediately before it stores or
+    returns once/session/always authorization.  A choice is only authoritative
+    if AFK is still clear at this final point; persistence (when requested)
+    happens inside the same transaction, so ``engage()`` is totally ordered
+    before or after the grant rather than racing a check-then-store gap.
+
+    State-resolution failures deny and signal every pending entry.  This is
+    intentionally broader than :class:`AfkStateError`: filesystem adapters,
+    monkeypatched/platform readers, and unexpected decode failures must all
+    fail closed at the authorization boundary.
+    """
+    from agent import afk
+
+    if choice not in {"once", "session", "always"}:
+        return {"authorized": False, "resolved": True, "choice": choice}
+    try:
+        with afk.status_transaction():
+            if afk.is_afk():
+                deny_pending_approvals_for_afk()
+                return {
+                    "authorized": False,
+                    "resolved": True,
+                    "choice": "deny",
+                    "reason": afk.APPROVAL_DENY_REASON,
+                    "afk_denied": True,
+                }
+            if persist is not None:
+                persist()
+            return {
+                "authorized": True,
+                "resolved": True,
+                "choice": choice,
+            }
+    except Exception:
+        logger.warning(
+            "Interactive authorization denied because machine-global AFK "
+            "status could not be safely resolved",
+            exc_info=True,
+        )
+        _deny_all_gateway_entries(
+            afk.APPROVAL_STATUS_UNKNOWN_REASON, "availability"
+        )
+        return {
+            "authorized": False,
+            "resolved": True,
+            "choice": "deny",
+            "reason": afk.APPROVAL_STATUS_UNKNOWN_REASON,
+            "availability_denied": True,
+        }
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2838,28 +3049,89 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
-    with _lock:
-        queue = _gateway_queues.get(session_key)
-        if not queue:
-            return 0
-        if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
-            if not targets:
-                return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
-        elif resolve_all:
-            targets = list(queue)
-            queue.clear()
-        else:
-            targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+    from agent import afk
+
+    # The first transaction claims the requested entries and records only a
+    # provisional response.  ``event.set()`` is deliberately outside it: a
+    # transport may block while waking its consumer, and AFK must remain able
+    # to commit during that interval.  A second transaction then revalidates
+    # availability at the actual resolver commit point.  Waiters observe the
+    # result only after ``resolution_committed`` is set, and every caller also
+    # performs its own final check immediately before persistence/execution.
+    try:
+        with afk.status_transaction():
+            away = afk.is_afk()
+            forced_afk_deny = away and choice in {"once", "session", "always"}
+            with _lock:
+                queue = _gateway_queues.get(session_key)
+                if not queue:
+                    return 0
+                if request_id:
+                    targets = [
+                        entry
+                        for entry in queue
+                        if entry.data.get("request_id") == request_id
+                    ]
+                    if not targets:
+                        return 0
+                    queue[:] = [entry for entry in queue if entry not in targets]
+                elif resolve_all:
+                    targets = list(queue)
+                    queue.clear()
+                else:
+                    targets = [queue.pop(0)]
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+                for entry in targets:
+                    entry.resolution_committed.clear()
+                    if forced_afk_deny:
+                        entry.result = "deny"
+                        entry.reason = afk.APPROVAL_DENY_REASON
+                        entry.resolution_source = "afk"
+                    else:
+                        entry.result = choice
+                        entry.resolution_source = "resolving"
+                        if reason:
+                            entry.reason = reason
+    except Exception:
+        logger.warning(
+            "Gateway approval denied because machine-global AFK status could "
+            "not be safely resolved",
+            exc_info=True,
+        )
+        return _deny_all_gateway_entries(
+            afk.APPROVAL_STATUS_UNKNOWN_REASON, "availability"
+        )
 
     for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
         entry.event.set()
+
+    try:
+        with afk.status_transaction():
+            away = afk.is_afk()
+            if away and choice in {"once", "session", "always"}:
+                _force_entries_denied(
+                    targets, afk.APPROVAL_DENY_REASON, "afk"
+                )
+            else:
+                with _lock:
+                    for entry in targets:
+                        if entry.resolution_source == "resolving":
+                            entry.resolution_source = "user"
+    except Exception:
+        logger.warning(
+            "Gateway approval denied at final AFK revalidation",
+            exc_info=True,
+        )
+        _force_entries_denied(
+            targets, afk.APPROVAL_STATUS_UNKNOWN_REASON, "availability"
+        )
+        _deny_all_gateway_entries(
+            afk.APPROVAL_STATUS_UNKNOWN_REASON, "availability"
+        )
+    finally:
+        for entry in targets:
+            entry.resolution_committed.set()
     return len(targets)
 
 
@@ -2964,6 +3236,7 @@ def clear_session(session_key: str) -> None:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
         entry.result = "deny"
+        entry.resolution_committed.set()
         entry.event.set()
     _release_permission_mode_dependents(session_key)
 
@@ -3220,6 +3493,9 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
     once_only = smart_denied or not allow_session
 
     if approval_callback is not None:
+        presentation_denial = approval_presentation_denial()
+        if presentation_denial is not None:
+            return _presentation_denial_choice(presentation_denial)
         try:
             callback_kwargs = {"allow_permanent": allow_permanent}
             if not allow_session:
@@ -3259,6 +3535,10 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
         # to the legacy input() path (safe in non-TUI contexts: scripts,
         # tests, sshd, etc.).
         pass
+
+    presentation_denial = approval_presentation_denial()
+    if presentation_denial is not None:
+        return _presentation_denial_choice(presentation_denial)
 
     os.environ["HERMES_SPINNER_PAUSE"] = "1"
     try:
@@ -3784,6 +4064,23 @@ def _run_approval_gate(
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
+            availability_message = _availability_denial_message(
+                decision, "Action could not be presented for approval"
+            )
+            if availability_message:
+                return {
+                    "approved": False,
+                    "message": availability_message,
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": (
+                        "afk_denied"
+                        if decision.get("afk_denied")
+                        else "availability_unknown"
+                    ),
+                    "user_consent": False,
+                    "deny_reason": decision.get("reason"),
+                }
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
@@ -3815,12 +4112,24 @@ def _run_approval_gate(
                     "deny_reason": deny_reason,
                 }
 
-            if choice == "session":
-                approve_session(session_key, pattern_key)
-            elif choice == "always":
-                approve_session(session_key, pattern_key)
-                approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+            def _persist_choice() -> None:
+                if choice == "session":
+                    approve_session(session_key, pattern_key)
+                elif choice == "always":
+                    approve_session(session_key, pattern_key)
+                    approve_permanent(pattern_key)
+                    save_permanent_allowlist(_permanent_approved)
+
+            authorization = _finalize_interactive_authorization(
+                choice, _persist_choice
+            )
+            if not authorization["authorized"]:
+                return _availability_block_result(
+                    authorization,
+                    subject="Action authorization was withdrawn",
+                    pattern_key=pattern_key,
+                    description=description,
+                )
             return {"approved": True, "message": None}
 
         # No notify callback: interactive CLI with a panel callback should
@@ -3850,6 +4159,18 @@ def _run_approval_gate(
                 ),
             }
 
+    # AFK/unknown availability is an automatic denial, not an approval
+    # lifecycle event. Check before plugins or UI see the request so an
+    # already-away operator produces zero presentation callbacks everywhere.
+    presentation_denial = approval_presentation_denial()
+    if presentation_denial is not None:
+        return _availability_block_result(
+            presentation_denial,
+            subject="Action could not be presented for approval",
+            pattern_key=pattern_key,
+            description=description,
+        )
+
     _fire_approval_hook(
         "pre_approval_request",
         command=display_target,
@@ -3871,6 +4192,15 @@ def _run_approval_gate(
         surface="cli",
         choice=choice,
     )
+
+    presentation_denial = approval_presentation_denial_for_choice(choice)
+    if presentation_denial is not None:
+        return _availability_block_result(
+            presentation_denial,
+            subject="Action could not be presented for approval",
+            pattern_key=pattern_key,
+            description=description,
+        )
 
     if choice == "timeout":
         return {
@@ -3901,12 +4231,22 @@ def _run_approval_gate(
             "user_consent": False,
         }
 
-    if choice == "session":
-        approve_session(session_key, pattern_key)
-    elif choice == "always":
-        approve_session(session_key, pattern_key)
-        approve_permanent(pattern_key)
-        save_permanent_allowlist(_permanent_approved)
+    def _persist_choice() -> None:
+        if choice == "session":
+            approve_session(session_key, pattern_key)
+        elif choice == "always":
+            approve_session(session_key, pattern_key)
+            approve_permanent(pattern_key)
+            save_permanent_allowlist(_permanent_approved)
+
+    authorization = _finalize_interactive_authorization(choice, _persist_choice)
+    if not authorization["authorized"]:
+        return _availability_block_result(
+            authorization,
+            subject="Action authorization was withdrawn",
+            pattern_key=pattern_key,
+            description=description,
+        )
 
     return {"approved": True, "message": None}
 
@@ -4187,6 +4527,14 @@ def _present_with_selected_transport(
             "name": name,
         }
 
+    presentation_denial = approval_presentation_denial()
+    if presentation_denial is not None:
+        return {
+            "selected": True,
+            "availability_denial": presentation_denial,
+            "name": name,
+        }
+
     try:
         from agent.redact import redact_sensitive_text
         from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
@@ -4238,6 +4586,14 @@ def _present_with_selected_transport(
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for plugin approval transport")
 
+    presentation_denial = approval_presentation_denial()
+    if presentation_denial is not None:
+        return {
+            "selected": True,
+            "availability_denial": presentation_denial,
+            "name": name,
+        }
+
     with human_wait_window(session_key):
         result = invoke_approval_transport(
             registered.present,
@@ -4284,6 +4640,43 @@ def _transport_denied_result(
         "description": description,
         "outcome": f"transport_{failure}",
         "user_consent": False,
+    }
+
+
+def _availability_denial_message(decision: dict, subject: str) -> Optional[str]:
+    """Truthfully render an automatic AFK/unknown-status denial."""
+    if not (
+        decision.get("afk_denied")
+        or decision.get("availability_denied")
+    ):
+        return None
+    reason = decision.get("reason") or "No consent was granted."
+    return (
+        f"BLOCKED: {subject}. {reason} Do NOT retry, rephrase, or attempt the "
+        "same outcome through another route until the operator is available."
+    )
+
+
+def _availability_block_result(
+    decision: dict,
+    *,
+    subject: str,
+    pattern_key: str,
+    description: str,
+) -> dict:
+    """Normalize a final AFK/unknown-status denial for tool guards."""
+    return {
+        "approved": False,
+        "message": _availability_denial_message(decision, subject),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": (
+            "afk_denied"
+            if decision.get("afk_denied")
+            else "availability_unknown"
+        ),
+        "user_consent": False,
+        "deny_reason": decision.get("reason"),
     }
 
 
@@ -4347,6 +4740,10 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
                 choice = "deny"
                 resolved = True
                 break
+            if _enforce_current_availability_on_pending() and leader.event.is_set():
+                choice = leader.result
+                resolved = choice is not None
+                break
             _remaining = _deadline - time.monotonic()
             if _remaining <= 0:
                 choice = None
@@ -4359,6 +4756,14 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
                 touch_activity_if_due(
                     _activity_state, "waiting for user approval"
                 )
+
+    if resolved and leader.event.is_set():
+        # A gateway resolver exposes only its provisional choice through the
+        # first event. Wait until its final AFK revalidation has committed.
+        # Legacy/direct event setters leave this event pre-set.
+        leader.resolution_committed.wait()
+        choice = leader.result
+        resolved = choice is not None
 
     if choice == "once":
         # Single-use consent — the caller re-prompts. The post hook fires
@@ -4377,12 +4782,17 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
         choice=_outcome,
         coalesced=True,
     )
-    return {
+    result = {
         "resolved": resolved,
         "choice": choice,
         "reason": getattr(leader, "reason", None),
         "coalesced": True,
     }
+    if getattr(leader, "resolution_source", None) == "afk":
+        result["afk_denied"] = True
+    elif getattr(leader, "resolution_source", None) == "availability":
+        result["availability_denied"] = True
+    return result
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
@@ -4422,27 +4832,105 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     #   once             → single-use consent; it covers ONLY the leader's
     #     execution, so the follower falls through to a fresh prompt.
     leader = None
-    with _lock:
-        for existing in _gateway_queues.get(session_key, []):
-            data = existing.data
-            if (
-                data.get("command") == approval_data.get("command")
-                and list(data.get("pattern_keys") or [])
-                == list(approval_data.get("pattern_keys") or [])
-            ):
-                leader = existing
-                break
+    entry = None
+    try:
+        # This lock is shared with engage() and resolver grants. Holding it
+        # through enqueue + notify gives those operations a total ordering:
+        # notification completed before AFK engaged, or AFK is observed and no
+        # callback/hook is invoked. There is no check-then-notify window.
+        from agent import afk
+
+        with afk.status_transaction():
+            presentation_denial = approval_presentation_denial()
+            if presentation_denial is not None:
+                return presentation_denial
+            with _lock:
+                for existing in _gateway_queues.get(session_key, []):
+                    data = existing.data
+                    if (
+                        data.get("command") == approval_data.get("command")
+                        and list(data.get("pattern_keys") or [])
+                        == list(approval_data.get("pattern_keys") or [])
+                    ):
+                        leader = existing
+                        break
+                if leader is None:
+                    entry = _ApprovalEntry(approval_data)
+                    _gateway_queues.setdefault(session_key, []).append(entry)
+
+            if leader is None:
+                # Hooks can have external effects, so they are behind the same
+                # AFK check as the user-facing callback.
+                _fire_approval_hook(
+                    "pre_approval_request",
+                    command=command,
+                    description=description,
+                    pattern_key=primary_key,
+                    pattern_keys=list(all_keys),
+                    session_key=session_key,
+                    surface=surface,
+                )
+                # A synchronous hook may itself engage AFK. Re-read inside
+                # the same re-entrant transaction before crossing the actual
+                # notification boundary; engage() has already denied and
+                # signalled this entry in that case.
+                presentation_denial = approval_presentation_denial()
+                if presentation_denial is not None:
+                    return presentation_denial
+                try:
+                    notify_cb(dict(entry.data))
+                except Exception as exc:
+                    logger.warning("Gateway approval notify failed: %s", exc)
+                    with _lock:
+                        queue = _gateway_queues.get(session_key, [])
+                        if entry in queue:
+                            queue.remove(entry)
+                        if not queue:
+                            _gateway_queues.pop(session_key, None)
+                    _fire_approval_hook(
+                        "post_approval_response",
+                        command=command,
+                        description=description,
+                        pattern_key=primary_key,
+                        pattern_keys=list(all_keys),
+                        session_key=session_key,
+                        surface=surface,
+                        choice="notify_failed",
+                    )
+                    return {
+                        "resolved": False,
+                        "choice": None,
+                        "notify_failed": True,
+                    }
+    except Exception:
+        logger.warning(
+            "Approval denied because machine-global AFK status could not be "
+            "safely verified",
+            exc_info=True,
+        )
+        _deny_all_gateway_entries(
+            afk.APPROVAL_STATUS_UNKNOWN_REASON, "availability"
+        )
+        return {
+            "resolved": True,
+            "choice": "deny",
+            "reason": afk.APPROVAL_STATUS_UNKNOWN_REASON,
+            "availability_denied": True,
+        }
+
     if leader is not None:
         adopted = _await_coalesced_leader(
             session_key, leader, approval_data, surface=surface
         )
         if adopted is not None:
             return adopted
-        # Leader resolved "once" — fall through to a fresh prompt below.
+        # Leader resolved "once". Re-enter the full status transaction rather
+        # than falling through after a stale pre-wait AFK check.
+        return _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface=surface
+        )
 
-    entry = _ApprovalEntry(approval_data)
-    with _lock:
-        _gateway_queues.setdefault(session_key, []).append(entry)
+    assert entry is not None
 
     def _drop_entry() -> None:
         with _lock:
@@ -4451,36 +4939,6 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 queue.remove(entry)
             if not queue:
                 _gateway_queues.pop(session_key, None)
-
-    # Notify plugins that an approval is being requested. Fires before the
-    # gateway notify callback so observers get the event in real time.
-    _fire_approval_hook(
-        "pre_approval_request",
-        command=command,
-        description=description,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface=surface,
-    )
-
-    # Notify the user (bridges sync agent thread → async gateway)
-    try:
-        notify_cb(dict(entry.data))
-    except Exception as exc:
-        logger.warning("Gateway approval notify failed: %s", exc)
-        _drop_entry()
-        _fire_approval_hook(
-            "post_approval_response",
-            command=command,
-            description=description,
-            pattern_key=primary_key,
-            pattern_keys=list(all_keys),
-            session_key=session_key,
-            surface=surface,
-            choice="notify_failed",
-        )
-        return {"resolved": False, "choice": None, "notify_failed": True}
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
@@ -4537,6 +4995,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 entry.event.set()
                 resolved = True
                 break
+            if _enforce_current_availability_on_pending() and entry.event.is_set():
+                resolved = True
+                break
             _remaining = _deadline - time.monotonic()
             if _remaining <= 0:
                 break
@@ -4545,6 +5006,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 break
             if touch_activity_if_due is not None:
                 touch_activity_if_due(_activity_state, "waiting for user approval")
+
+    if resolved and entry.event.is_set():
+        # Do not consume a provisional resolver grant. The resolver re-checks
+        # AFK after waking us and sets this event on every success/error path.
+        entry.resolution_committed.wait()
 
     _drop_entry()
 
@@ -4563,7 +5029,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    result = {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+    }
+    if entry.resolution_source == "afk":
+        result["afk_denied"] = True
+    elif entry.resolution_source == "availability":
+        result["availability_denied"] = True
+    return result
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -4925,6 +5400,14 @@ def check_all_command_guards(command: str, env_type: str,
         allow_permanent=has_permanent_capable and not smart_denied_for_owner,
     )
     if transport_attempt.get("selected"):
+        presentation_denial = transport_attempt.get("availability_denial")
+        if presentation_denial is not None:
+            return _availability_block_result(
+                presentation_denial,
+                subject="Command could not be presented for approval",
+                pattern_key=primary_key,
+                description=combined_desc,
+            )
         transport_failure = transport_attempt.get("failure")
         if transport_failure and transport_attempt.get("fallback") == "builtin":
             logger.warning(
@@ -4956,16 +5439,28 @@ def check_all_command_guards(command: str, env_type: str,
                     "outcome": "denied",
                     "user_consent": False,
                 }
-            if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if transport_choice == "session" or (
-                        transport_choice == "always" and is_tirith
-                    ):
-                        approve_session(session_key, key)
-                    elif transport_choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+            def _persist_transport_choice() -> None:
+                if not smart_denied_for_owner:
+                    for key, _, is_tirith in warnings:
+                        if transport_choice == "session" or (
+                            transport_choice == "always" and is_tirith
+                        ):
+                            approve_session(session_key, key)
+                        elif transport_choice == "always":
+                            approve_session(session_key, key)
+                            approve_permanent(key)
+                            save_permanent_allowlist(_permanent_approved)
+
+            authorization = _finalize_interactive_authorization(
+                transport_choice, _persist_transport_choice
+            )
+            if not authorization["authorized"]:
+                return _availability_block_result(
+                    authorization,
+                    subject="Command authorization was withdrawn",
+                    pattern_key=primary_key,
+                    description=combined_desc,
+                )
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -5026,6 +5521,23 @@ def check_all_command_guards(command: str, env_type: str,
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
+            availability_message = _availability_denial_message(
+                decision, "Command could not be presented for approval"
+            )
+            if availability_message:
+                return {
+                    "approved": False,
+                    "message": availability_message,
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": (
+                        "afk_denied"
+                        if decision.get("afk_denied")
+                        else "availability_unknown"
+                    ),
+                    "user_consent": False,
+                    "deny_reason": decision.get("reason"),
+                }
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
@@ -5072,14 +5584,28 @@ def check_all_command_guards(command: str, env_type: str,
             # A smart-DENY owner override is always one operation, even if an
             # older client returns "session" or "always". Manual and ESCALATE
             # choices retain their existing persistence semantics.
-            if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if choice == "session" or (choice == "always" and is_tirith):
-                        approve_session(session_key, key)
-                    elif choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+            def _persist_gateway_choice() -> None:
+                if not smart_denied_for_owner:
+                    for key, _, is_tirith in warnings:
+                        if choice == "session" or (
+                            choice == "always" and is_tirith
+                        ):
+                            approve_session(session_key, key)
+                        elif choice == "always":
+                            approve_session(session_key, key)
+                            approve_permanent(key)
+                            save_permanent_allowlist(_permanent_approved)
+
+            authorization = _finalize_interactive_authorization(
+                choice, _persist_gateway_choice
+            )
+            if not authorization["authorized"]:
+                return _availability_block_result(
+                    authorization,
+                    subject="Command authorization was withdrawn",
+                    pattern_key=primary_key,
+                    description=combined_desc,
+                )
 
             # A human approval (including an ESCALATE-then-approve or a
             # smart-DENY owner override) resets the consecutive-denial tally.
@@ -5160,6 +5686,15 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
+    presentation_denial = approval_presentation_denial_for_choice(choice)
+    if presentation_denial is not None:
+        return _availability_block_result(
+            presentation_denial,
+            subject="Command could not be presented for approval",
+            pattern_key=primary_key,
+            description=combined_desc,
+        )
+
     if choice == "timeout":
         breaker_addendum = _denial_breaker_addendum(session_key)
         return {
@@ -5199,16 +5734,26 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Smart-DENY owner overrides are one-operation scoped. Preserve existing
     # persistence for manual mode and smart ESCALATE.
-    if not smart_denied_for_owner:
-        for key, _, is_tirith in warnings:
-            if choice == "session" or (choice == "always" and is_tirith):
-                # tirith: session only (no permanent broad allowlisting)
-                approve_session(session_key, key)
-            elif choice == "always":
-                # dangerous patterns: permanent allowed
-                approve_session(session_key, key)
-                approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
+    def _persist_cli_choice() -> None:
+        if not smart_denied_for_owner:
+            for key, _, is_tirith in warnings:
+                if choice == "session" or (choice == "always" and is_tirith):
+                    # tirith: session only (no permanent broad allowlisting)
+                    approve_session(session_key, key)
+                elif choice == "always":
+                    # dangerous patterns: permanent allowed
+                    approve_session(session_key, key)
+                    approve_permanent(key)
+                    save_permanent_allowlist(_permanent_approved)
+
+    authorization = _finalize_interactive_authorization(choice, _persist_cli_choice)
+    if not authorization["authorized"]:
+        return _availability_block_result(
+            authorization,
+            subject="Command authorization was withdrawn",
+            pattern_key=primary_key,
+            description=combined_desc,
+        )
 
     # A human approval resets the consecutive-denial tally.
     _reset_denials(session_key)
@@ -5395,6 +5940,14 @@ def check_execute_code_guard(code: str, env_type: str,
         allow_permanent=not smart_denied_for_owner,
     )
     if transport_attempt.get("selected"):
+        presentation_denial = transport_attempt.get("availability_denial")
+        if presentation_denial is not None:
+            return _availability_block_result(
+                presentation_denial,
+                subject="execute_code script could not be presented for approval",
+                pattern_key=pattern_key,
+                description=description,
+            )
         transport_failure = transport_attempt.get("failure")
         if transport_failure and transport_attempt.get("fallback") == "builtin":
             logger.warning(
@@ -5423,13 +5976,25 @@ def check_execute_code_guard(code: str, env_type: str,
                     "outcome": "denied",
                     "user_consent": False,
                 }
-            if not smart_denied_for_owner:
-                if choice == "session":
-                    approve_session(session_key, pattern_key)
-                elif choice == "always":
-                    approve_session(session_key, pattern_key)
-                    approve_permanent(pattern_key)
-                    save_permanent_allowlist(_permanent_approved)
+            def _persist_transport_choice() -> None:
+                if not smart_denied_for_owner:
+                    if choice == "session":
+                        approve_session(session_key, pattern_key)
+                    elif choice == "always":
+                        approve_session(session_key, pattern_key)
+                        approve_permanent(pattern_key)
+                        save_permanent_allowlist(_permanent_approved)
+
+            authorization = _finalize_interactive_authorization(
+                choice, _persist_transport_choice
+            )
+            if not authorization["authorized"]:
+                return _availability_block_result(
+                    authorization,
+                    subject="execute_code authorization was withdrawn",
+                    pattern_key=pattern_key,
+                    description=description,
+                )
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -5482,6 +6047,17 @@ def check_execute_code_guard(code: str, env_type: str,
                 choice=choice,
             )
 
+            presentation_denial = approval_presentation_denial_for_choice(choice)
+            if presentation_denial is not None:
+                return _availability_block_result(
+                    presentation_denial,
+                    subject=(
+                        "execute_code script could not be presented for approval"
+                    ),
+                    pattern_key=pattern_key,
+                    description=description,
+                )
+
             if choice == "timeout":
                 breaker_addendum = _denial_breaker_addendum(session_key)
                 return {
@@ -5518,13 +6094,25 @@ def check_execute_code_guard(code: str, env_type: str,
                     "outcome": "denied",
                     "user_consent": False,
                 }
-            if not smart_denied_for_owner:
-                if choice == "session":
-                    approve_session(session_key, pattern_key)
-                elif choice == "always":
-                    approve_session(session_key, pattern_key)
-                    approve_permanent(pattern_key)
-                    save_permanent_allowlist(_permanent_approved)
+            def _persist_cli_choice() -> None:
+                if not smart_denied_for_owner:
+                    if choice == "session":
+                        approve_session(session_key, pattern_key)
+                    elif choice == "always":
+                        approve_session(session_key, pattern_key)
+                        approve_permanent(pattern_key)
+                        save_permanent_allowlist(_permanent_approved)
+
+            authorization = _finalize_interactive_authorization(
+                choice, _persist_cli_choice
+            )
+            if not authorization["authorized"]:
+                return _availability_block_result(
+                    authorization,
+                    subject="execute_code authorization was withdrawn",
+                    pattern_key=pattern_key,
+                    description=description,
+                )
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -5588,6 +6176,24 @@ def check_execute_code_guard(code: str, env_type: str,
             "user_consent": False,
         }
 
+    availability_message = _availability_denial_message(
+        decision, "execute_code script could not be presented for approval"
+    )
+    if availability_message:
+        return {
+            "approved": False,
+            "message": availability_message,
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": (
+                "afk_denied"
+                if decision.get("afk_denied")
+                else "availability_unknown"
+            ),
+            "user_consent": False,
+            "deny_reason": decision.get("reason"),
+        }
+
     resolved = decision["resolved"]
     choice = decision["choice"]
     deny_reason = decision.get("reason")
@@ -5617,13 +6223,25 @@ def check_execute_code_guard(code: str, env_type: str,
     # Never persist a smart-DENY override under the coarse execute_code key;
     # doing so would approve unrelated future scripts. Manual and ESCALATE
     # decisions preserve their existing session/permanent behavior.
-    if not smart_denied_for_owner:
-        if choice == "session":
-            approve_session(session_key, pattern_key)
-        elif choice == "always":
-            approve_session(session_key, pattern_key)
-            approve_permanent(pattern_key)
-            save_permanent_allowlist(_permanent_approved)
+    def _persist_gateway_choice() -> None:
+        if not smart_denied_for_owner:
+            if choice == "session":
+                approve_session(session_key, pattern_key)
+            elif choice == "always":
+                approve_session(session_key, pattern_key)
+                approve_permanent(pattern_key)
+                save_permanent_allowlist(_permanent_approved)
+
+    authorization = _finalize_interactive_authorization(
+        choice, _persist_gateway_choice
+    )
+    if not authorization["authorized"]:
+        return _availability_block_result(
+            authorization,
+            subject="execute_code authorization was withdrawn",
+            pattern_key=pattern_key,
+            description=description,
+        )
     # choice == "once": no persistence — approval lasts this single call only.
 
     # A human approval resets the consecutive-denial tally.
@@ -5696,7 +6314,8 @@ def request_elicitation_consent(
             return "cancel"
         choice = decision.get("choice")
         if choice in ("once", "session", "always"):
-            return "accept"
+            authorization = _finalize_interactive_authorization(choice)
+            return "accept" if authorization["authorized"] else "decline"
         return "decline"
 
     # CLI / TUI path. allow_permanent=False because elicitation is a
@@ -5707,6 +6326,7 @@ def request_elicitation_consent(
             description,
             timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            approval_callback=_resolve_cli_approval_callback(),
         )
     except Exception as exc:
         logger.error(
@@ -5715,7 +6335,8 @@ def request_elicitation_consent(
         return "decline"
 
     if choice in ("once", "session", "always"):
-        return "accept"
+        authorization = _finalize_interactive_authorization(choice)
+        return "accept" if authorization["authorized"] else "decline"
     if choice == "timeout":
         # Prompt expired without a user response — mirror the gateway's
         # unresolved outcome ("cancel") rather than an explicit decline.

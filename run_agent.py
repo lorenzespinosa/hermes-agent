@@ -2266,8 +2266,13 @@ class AIAgent:
                 # prologue for prefetch/plugin injections). Written verbatim
                 # so replay can reproduce the sent prefix byte-for-byte.
                 _row_api_content = msg.get("api_content")
-                if not isinstance(_row_api_content, str):
+                if not (
+                    isinstance(_row_api_content, str)
+                    or isinstance(_row_api_content, list)
+                ):
                     _row_api_content = None
+                else:
+                    _row_api_content = copy.deepcopy(_row_api_content)
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). A multimodal override is a complete

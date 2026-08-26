@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any, Dict, Optional
 from unittest.mock import patch
 
@@ -300,6 +301,63 @@ def test_always_approve_covers_foreground():
         cu._request_approval("click", {"delivery_mode": "foreground"}, "run-C")
         assert len(calls) == 1
     finally:
+        cu.set_approval_callback(None)
+
+
+@pytest.mark.parametrize("afk_timing", ["before-presentation", "mid-prompt"])
+def test_computer_approval_obeys_afk_presentation_and_finalization(
+    tmp_path, monkeypatch, afk_timing
+):
+    from agent import afk
+    from tools.computer_use import tool as cu
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_count = 0
+
+    def cb(_action, _args, _summary):
+        nonlocal callback_count
+        callback_count += 1
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        return "approve_session"
+
+    cu.set_approval_callback(cb)
+    outcome = {}
+    done = threading.Event()
+
+    def request():
+        try:
+            outcome["result"] = cu._request_approval(
+                "click", {"element": 7}, "afk-computer"
+            )
+        except BaseException as exc:  # pragma: no cover - failure detail
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    try:
+        if afk_timing == "before-presentation":
+            afk.engage(reason="already away")
+        thread = threading.Thread(target=request, daemon=True)
+        thread.start()
+        if afk_timing == "mid-prompt":
+            assert callback_entered.wait(timeout=5)
+            afk.engage(reason="computer prompt still open")
+            release_callback.set()
+
+        assert done.wait(timeout=5)
+        thread.join(timeout=1)
+        assert "error" not in outcome, outcome.get("error")
+        assert callback_count == (1 if afk_timing == "mid-prompt" else 0)
+        result = json.loads(outcome["result"])
+        assert result["error"] == afk.APPROVAL_DENY_REASON
+        with cu._approval_lock:
+            assert cu._always_allow.get("afk-computer", set()) == set()
+            assert cu._session_auto_approve.get("afk-computer") is not True
+    finally:
+        release_callback.set()
         cu.set_approval_callback(None)
 
 

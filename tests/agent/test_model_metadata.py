@@ -122,23 +122,48 @@ class TestEstimateMessagesTokensRough:
         # substituted (which would undercount the real request).
         assert result >= (len(big_sidecar) // 4) * 0.9
 
-    def test_non_string_api_content_does_not_displace_content(self):
+    def test_only_supported_api_content_shapes_displace_content(self):
         """Only a sidecar shape the wire actually substitutes may displace content.
 
-        ``substitute_api_content()`` overwrites ``content`` only for a
-        non-empty STRING sidecar on a user/assistant row; every other shape
-        is popped and discarded, leaving the clean ``content`` on the wire.
-        The shadow must mirror that guard — substituting unconditionally
-        would drop the real content from the estimate and UNDERcount, which
-        is the dangerous direction (compaction fires too late and the turn
-        dies on a hard context error).
+        ``substitute_api_content()`` overwrites ``content`` for any explicit
+        string or multimodal-list sidecar on a user/assistant row, including
+        empty values (presence is distinct from absence). Every other shape is
+        popped and discarded, leaving clean ``content``. The shadow must mirror
+        that guard — substituting unsupported values would drop the real content
+        from the estimate and UNDERcount, which is the dangerous direction.
         """
         body = "clean stored content " * 2000
         baseline = estimate_messages_tokens_rough([{"role": "user", "content": body}])
 
-        for bad_sidecar in (None, "", 42, ["not", "a", "string"]):
+        for bad_sidecar in (None, 42, {"not": "wire content"}):
             msg = {"role": "user", "content": body, "api_content": bad_sidecar}
             assert estimate_messages_tokens_rough([msg]) >= baseline, bad_sidecar
+
+        for empty_sidecar in ("", []):
+            persisted = {
+                "role": "user",
+                "content": body,
+                "api_content": empty_sidecar,
+            }
+            wire = {"role": "user", "content": empty_sidecar}
+            assert estimate_messages_tokens_rough([persisted]) == \
+                estimate_messages_tokens_rough([wire])
+
+        list_sidecar = [
+            {"type": "text", "text": "short wire content"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            },
+        ]
+        persisted = {
+            "role": "user",
+            "content": body,
+            "api_content": list_sidecar,
+        }
+        wire = {"role": "user", "content": list_sidecar}
+        assert estimate_messages_tokens_rough([persisted]) == \
+            estimate_messages_tokens_rough([wire])
 
         # Same for a role the substitution never applies to.
         tool_row = {"role": "tool", "content": body, "api_content": "ignored"}
@@ -149,8 +174,7 @@ class TestEstimateMessagesTokensRough:
 
         Both estimator helpers now share one shadow builder; this pins the
         flat per-image accounting that the extraction moved, independent of
-        the ``api_content`` fix (a valid sidecar is a string, so it cannot
-        carry an image list).
+        the ``api_content`` fix, including a valid structured sidecar.
         """
         import base64
         import os

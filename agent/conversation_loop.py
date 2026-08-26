@@ -45,6 +45,7 @@ from agent.turn_context import (
     _review_fork_first_request_pending,
     build_turn_context,
     compose_user_api_content,
+    is_api_content_sidecar,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -1928,6 +1929,7 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _afk_user_context = _ctx.afk_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Commentary deduplication spans all provider continuations and tool calls
@@ -2006,8 +2008,15 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        _codex_user_message = compose_user_api_content(
+            user_message, "", "", _afk_user_context
+        )
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=(
+                _codex_user_message
+                if _codex_user_message is not None
+                else user_message
+            ),
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
@@ -2291,7 +2300,7 @@ def run_conversation(
             # never mutated beyond the api_content stamp, so nothing leaks
             # into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
+                if is_api_content_sidecar(_api_content):
                     # Stamped by the prologue from the same composition —
                     # reuse it so the persisted sidecar and the wire cannot
                     # drift, and so every pass this turn sends identical
@@ -2304,12 +2313,12 @@ def run_conversation(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
+                        _afk_user_context,
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
             elif (
-                isinstance(_api_content, str)
-                and _api_content
+                is_api_content_sidecar(_api_content)
                 and msg.get("role") in ("user", "assistant")
             ):
                 # Historical message: replay the exact bytes sent when it was

@@ -110,6 +110,46 @@ def _make_runner(*, platform_extra: dict | None = None,
     return runner
 
 
+def test_afk_mutation_requires_configured_admin_even_when_legacy_gate_is_off():
+    runner = _make_runner(platform_extra={})
+    source = _make_source(user_id="guest")
+
+    denial = runner._check_slash_access(source, "afk")
+
+    assert denial is not None
+    assert "admin" in denial.lower()
+    assert "allow_admin_from" in denial
+    # The new hard requirement is command-specific. Existing commands retain
+    # the legacy unrestricted behavior when no admin list is configured.
+    assert runner._check_slash_access(source, "stop") is None
+
+
+def test_afk_rejects_non_admin_even_if_user_command_allowlist_contains_it():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["afk"],
+        }
+    )
+
+    assert runner._check_slash_access(_make_source(user_id="guest"), "afk")
+    assert runner._check_slash_access(_make_source(user_id="admin"), "afk") is None
+
+
+def test_group_afk_requires_group_admin_configuration():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["dm-admin"],
+            "group_allow_admin_from": ["group-admin"],
+        }
+    )
+    group_guest = _make_source(user_id="dm-admin", chat_type="group")
+    group_admin = _make_source(user_id="group-admin", chat_type="group")
+
+    assert runner._check_slash_access(group_guest, "afk")
+    assert runner._check_slash_access(group_admin, "afk") is None
+
+
 # ---------------------------------------------------------------------------
 # /whoami response shape — proves the handler is reachable AND uses the
 # resolver. We use /whoami because it's deterministic and short-circuits

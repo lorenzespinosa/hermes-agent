@@ -24,6 +24,7 @@ move-and-name refactor with no semantic change.
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -55,12 +56,14 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
-) -> Optional[str]:
+    afk_user_context: str = "",
+) -> Optional[Any]:
     """Compose the API-bound content of the current turn's user message.
 
-    Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    Sources: memory-manager prefetch, ``pre_llm_call`` plugin context with
+    target="user_message" (the default), and the current machine-global AFK
+    status. They are appended to the *API copy* only; stored content stays
+    clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -69,9 +72,19 @@ def compose_user_api_content(
     from the bytes on the wire — which is the whole prompt-cache invariant:
     what turn N sends must be what turn N+1 replays.
 
-    Returns ``None`` when nothing is injected (multimodal/non-string content,
-    or no ephemeral context), meaning the message is sent as-is.
+    AFK is the only volatile injection supported for multimodal content. It is
+    appended to a deep-cloned API list so a status that later clears never
+    persists in the transcript or mutates caller-owned content.
+
+    Returns ``None`` when nothing is injected, meaning the message is sent
+    as-is.
     """
+    if isinstance(content, list):
+        if not afk_user_context:
+            return None
+        api_content = copy.deepcopy(content)
+        api_content.append({"type": "text", "text": afk_user_context})
+        return api_content
     if not isinstance(content, str):
         return None
     injections = []
@@ -81,12 +94,24 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if afk_user_context:
+        injections.append(afk_user_context)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
 
 
-def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
+def is_api_content_sidecar(value: Any) -> bool:
+    """True for a string or multimodal-list wire sidecar, including empty.
+
+    Presence, not truthiness, is authoritative: an explicitly persisted empty
+    sidecar must replace clean content with ``""``/``[]`` on replay or the
+    provider prefix changes type/bytes between turns.
+    """
+    return isinstance(value, (str, list))
+
+
+def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[Any]:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
     Used at every API-bound message-build site (the ``api_messages`` build in
@@ -96,17 +121,17 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     they differ from the clean stored content; substituting it here keeps the
     provider prompt-cache prefix byte-stable across turns.
 
-    Returns the popped sidecar string (for callers that need the value for
-    current-turn composition logic) or ``None`` when absent.
+    Returns a deep copy of the popped string/list sidecar (for callers that
+    need the value for current-turn composition logic) or ``None`` when
+    absent. Structured content is never aliased back to the durable message.
     """
     sidecar = api_msg.pop("api_content", None)
     if (
-        isinstance(sidecar, str)
-        and sidecar
+        is_api_content_sidecar(sidecar)
         and api_msg.get("role") in ("user", "assistant")
     ):
-        api_msg["content"] = sidecar
-    return sidecar
+        api_msg["content"] = copy.deepcopy(sidecar)
+    return copy.deepcopy(sidecar)
 
 
 def drop_stale_api_content(msg: Dict[str, Any]) -> None:
@@ -121,14 +146,15 @@ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
-def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
+def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[Any]:
     """Extract the ``api_content`` sidecar from a message dict for persistence.
 
     Shared by the gateway/branch forwarding sites that copy the sidecar into a
-    new row. Returns the string sidecar or ``None`` when absent/non-string.
+    new row. Returns a deep-copied string/list sidecar or ``None`` when the
+    value is not a supported wire shape.
     """
     v = msg.get("api_content")
-    return v if isinstance(v, str) else None
+    return copy.deepcopy(v) if is_api_content_sidecar(v) else None
 
 
 def consume_gateway_turn_context_notes(agent: Any) -> str:
@@ -154,11 +180,9 @@ def consume_gateway_turn_context_notes(agent: Any) -> str:
 def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
     """Deliver must-deliver notes on a multimodal (list) user message.
 
-    ``compose_user_api_content`` returns ``None`` for non-string content, so
-    sidecar-borne facts would silently drop on image/attachment turns.  For
-    gateway must-deliver notes we instead append a text part to the content
-    list in place — the part becomes durable message content (persisted and
-    replayed as-is), which keeps the wire and the transcript byte-identical.
+    Gateway must-deliver notes predate the API-only structured sidecar used
+    for AFK availability. They remain durable transcript content by design,
+    so append them to the authored list in place and replay them as-is.
 
     Returns ``True`` when a part was appended.
     """
@@ -430,7 +454,7 @@ class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
 
     # Sanitized inbound message (surrogates stripped).
-    user_message: str
+    user_message: Any
     # Clean message preserved for transcripts / memory queries (no nudge injection).
     original_user_message: Any
     # Working message list for this turn (loop appends to it).
@@ -448,6 +472,8 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
+    # Current machine-global availability note (API-only, read each turn).
+    afk_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
@@ -1348,6 +1374,19 @@ def build_turn_context(
                 else _gateway_notes
             )
 
+    # Operator availability is machine-global, not a gateway capability. Read
+    # it in the shared turn prologue so CLI, API, TUI/desktop, ACP and messaging
+    # all receive the same current fact. Keep it in its own volatile lane:
+    # strings may persist the exact API sidecar for prompt-cache replay, while
+    # multimodal turns are cloned only at API-build time and never stamped.
+    try:
+        from agent.afk import turn_context_note
+
+        afk_user_context = turn_context_note() or ""
+    except Exception:
+        logger.warning("AFK turn-context read failed", exc_info=True)
+        afk_user_context = ""
+
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
@@ -1429,10 +1468,16 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            afk_user_context,
         )
-        if _api_content is not None and _api_content != _turn_user_msg.get("content"):
-            _turn_user_msg["api_content"] = _api_content
+        if (
+            is_api_content_sidecar(_api_content)
+            and _api_content != _turn_user_msg.get("content")
+        ):
+            _turn_user_msg["api_content"] = copy.deepcopy(_api_content)
             # In-place preflight compaction has ALREADY inserted this turn's
             # user row (archive_and_compact runs before prefetch/pre_llm_call
             # can compose the sidecar), and the crash persist below identity-
@@ -1450,7 +1495,7 @@ def build_turn_context(
                         _db.set_latest_user_api_content(
                             agent.session_id,
                             _turn_user_msg.get("content"),
-                            _api_content,
+                            copy.deepcopy(_api_content),
                         )
                     except Exception:
                         logger.warning(
@@ -1511,6 +1556,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        afk_user_context=afk_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )
