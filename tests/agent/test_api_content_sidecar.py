@@ -16,21 +16,23 @@ in-process mock provider.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
 import sqlite3
-import sys
 import tempfile
-import threading
 import types
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.memory_manager import build_memory_context_block
-from agent.turn_context import build_turn_context, compose_user_api_content
+from agent.turn_context import (
+    build_turn_context,
+    compose_user_api_content,
+    substitute_api_content,
+)
 from hermes_state import SessionDB
 
 
@@ -82,6 +84,181 @@ class TestSessionDbSidecar:
             db.append_message("s1", "user", content="hello", api_content="hello+ctx")
             rows = db.get_messages("s1")
             assert rows[0]["api_content"] == "hello+ctx"
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("sent", ["", []], ids=["empty-string", "empty-list"])
+    def test_empty_sidecars_round_trip_and_replay_exactly(self, tmp_path, sent):
+        """An empty wire sidecar is present state, not an absent sidecar."""
+        db = self._open(tmp_path)
+        try:
+            db.append_message(
+                "s1", "user", content="clean authored content", api_content=sent
+            )
+            for loaded in (
+                db.get_messages("s1")[0],
+                db.get_messages_as_conversation("s1")[0],
+            ):
+                assert "api_content" in loaded
+                assert loaded["api_content"] == sent
+                assert type(loaded["api_content"]) is type(sent)
+
+            replay = copy.deepcopy(db.get_messages_as_conversation("s1")[0])
+            substitute_api_content(replay)
+            assert "api_content" not in replay
+            assert replay["content"] == sent
+            assert type(replay["content"]) is type(sent)
+        finally:
+            db.close()
+
+    def test_structured_sidecar_round_trips_as_an_independent_copy(self, tmp_path):
+        db = self._open(tmp_path)
+        sent = [
+            {"type": "text", "text": "look"},
+            {"type": "text", "text": "receipt-time note"},
+        ]
+        try:
+            db.append_message(
+                "s1",
+                "user",
+                content="look\n[screenshot]",
+                api_content=sent,
+            )
+            sent[0]["text"] = "caller mutation"
+
+            conversation = db.get_messages_as_conversation("s1")
+            raw_rows = db.get_messages("s1")
+            assert conversation[0]["api_content"] == [
+                {"type": "text", "text": "look"},
+                {"type": "text", "text": "receipt-time note"},
+            ]
+            assert raw_rows[0]["api_content"] == conversation[0]["api_content"]
+            assert raw_rows[0]["api_content"] is not conversation[0]["api_content"]
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("role", ["user", "assistant"])
+    @pytest.mark.parametrize(
+        "sent",
+        [
+            "\x00json:[{\"type\":\"text\",\"text\":\"looks structured\"}]",
+            "\x00json:{not-json",
+            (
+                SessionDB._CONTENT_ENVELOPE_PREFIX
+                + '{"version":2,"type":"structured","value":["payload"]}'
+            ),
+            SessionDB._CONTENT_ENVELOPE_PREFIX + "{not-json",
+        ],
+        ids=[
+            "valid-legacy-marker",
+            "invalid-legacy-marker",
+            "valid-v2-marker",
+            "invalid-v2-marker",
+        ],
+    )
+    def test_marker_prefixed_string_sidecars_round_trip_verbatim(
+        self, tmp_path, role, sent
+    ):
+        """Marker-looking wire text is text, even when its suffix is valid JSON."""
+        db = self._open(tmp_path)
+        try:
+            db.append_message(
+                "s1",
+                role,
+                content=sent,
+                api_content=sent,
+            )
+
+            raw = db._conn.execute(
+                "SELECT api_content FROM messages WHERE session_id = ?",
+                ("s1",),
+            ).fetchone()[0]
+            assert raw.startswith(SessionDB._CONTENT_ENVELOPE_PREFIX)
+
+            for loaded in (
+                db.get_messages("s1")[0],
+                db.get_messages_as_conversation("s1")[0],
+            ):
+                assert isinstance(loaded["content"], str)
+                assert loaded["content"].encode("utf-8") == sent.encode("utf-8")
+                assert isinstance(loaded["api_content"], str)
+                assert loaded["api_content"].encode("utf-8") == sent.encode("utf-8")
+
+            replay = copy.deepcopy(db.get_messages_as_conversation("s1")[0])
+            substitute_api_content(replay)
+            assert "api_content" not in replay
+            assert isinstance(replay["content"], str)
+            assert replay["content"].encode("utf-8") == sent.encode("utf-8")
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("role", ["user", "assistant"])
+    def test_structured_sidecars_preserve_list_type_through_replay(
+        self, tmp_path, role
+    ):
+        sent = [
+            {"type": "text", "text": f"{role} text"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]
+        db = self._open(tmp_path)
+        try:
+            db.append_message(
+                "s1",
+                role,
+                content=sent,
+                api_content=sent,
+            )
+
+            for loaded in (
+                db.get_messages("s1")[0],
+                db.get_messages_as_conversation("s1")[0],
+            ):
+                assert isinstance(loaded["content"], list)
+                assert loaded["content"] == sent
+                assert isinstance(loaded["api_content"], list)
+                assert loaded["api_content"] == sent
+
+            replay = copy.deepcopy(db.get_messages_as_conversation("s1")[0])
+            substitute_api_content(replay)
+            assert "api_content" not in replay
+            assert isinstance(replay["content"], list)
+            assert replay["content"] == sent
+            assert replay["content"] is not sent
+        finally:
+            db.close()
+
+    def test_legacy_structured_rows_remain_readable(self, tmp_path):
+        """Existing NUL-json rows decode as structured content after upgrade."""
+        db = self._open(tmp_path)
+        legacy_content = [{"type": "text", "text": "legacy content"}]
+        legacy_sidecar = [{"type": "text", "text": "legacy sidecar"}]
+        try:
+            message_id = db.append_message(
+                "s1", "assistant", content="placeholder"
+            )
+            db._conn.execute(
+                "UPDATE messages SET content = ?, api_content = ? WHERE id = ?",
+                (
+                    SessionDB._CONTENT_JSON_PREFIX + json.dumps(legacy_content),
+                    SessionDB._CONTENT_JSON_PREFIX + json.dumps(legacy_sidecar),
+                    message_id,
+                ),
+            )
+            db._conn.commit()
+
+            for loaded in (
+                db.get_messages("s1")[0],
+                db.get_messages_as_conversation("s1")[0],
+            ):
+                assert loaded["content"] == legacy_content
+                assert isinstance(loaded["content"], list)
+                assert loaded["api_content"] == legacy_sidecar
+                assert isinstance(loaded["api_content"], list)
+
+            replay = copy.deepcopy(db.get_messages_as_conversation("s1")[0])
+            substitute_api_content(replay)
+            assert replay["content"] == legacy_sidecar
+            assert isinstance(replay["content"], list)
         finally:
             db.close()
 
@@ -241,7 +418,15 @@ def _build(agent, **overrides):
 
 @pytest.fixture(autouse=True)
 def _stub_runtime_main():
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+    from run_agent import AIAgent
+
+    with patch(
+        "agent.auxiliary_client.set_runtime_main", lambda *a, **k: None
+    ), patch.object(
+        AIAgent,
+        "_create_openai_client",
+        return_value=MagicMock(name="in-memory-openai-client"),
+    ):
         yield
 
 
@@ -351,52 +536,58 @@ class TestFlushOverrideSidecar:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end wire invariant against an in-process mock provider
+# End-to-end wire invariant at an in-memory Chat Completions boundary
 # ---------------------------------------------------------------------------
 
-class _MockHandler(BaseHTTPRequestHandler):
+
+class _MockProvider:
     captured_requests: list = []
     response_queue: list = []
 
-    def do_POST(self):  # noqa: N802 (http.server API)
-        length = int(self.headers.get("Content-Length", 0))
-        req = json.loads(self.rfile.read(length).decode())
-        type(self).captured_requests.append(req)
-        is_stream = req.get("stream") is True
-        if type(self).response_queue:
-            resp = type(self).response_queue.pop(0)
+    @classmethod
+    def create(cls, **kwargs):
+        cls.captured_requests.append(copy.deepcopy(kwargs))
+        if cls.response_queue:
+            response = cls.response_queue.pop(0)
         else:
-            resp = _text_resp("DONE")
-        msg = resp["choices"][0]["message"]
-        if is_stream:
-            content = msg.get("content") or ""
-            tcs = msg.get("tool_calls")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            chunks = [{"id": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}]
-            if content:
-                chunks.append({"id": "m", "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})
-            if tcs:
-                for ti, tc in enumerate(tcs):
-                    chunks.append({"id": "m", "choices": [{"index": 0, "delta": {"tool_calls": [{
-                        "index": ti, "id": tc["id"], "type": "function",
-                        "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]}, "finish_reason": None}]})
-            chunks.append({"id": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tcs else "stop"}]})
-            for c in chunks:
-                self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            body = json.dumps(resp).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    def log_message(self, *a, **kw):
-        pass
+            response = _text_resp("DONE")
+        choice_data = response["choices"][0]
+        message_data = choice_data["message"]
+        tool_calls = []
+        for tool_call in message_data.get("tool_calls") or []:
+            function = tool_call["function"]
+            tool_calls.append(
+                types.SimpleNamespace(
+                    id=tool_call.get("id"),
+                    type=tool_call.get("type", "function"),
+                    function=types.SimpleNamespace(
+                        name=function.get("name"),
+                        arguments=function.get("arguments", "{}"),
+                    ),
+                )
+            )
+        message = types.SimpleNamespace(
+            role=message_data.get("role", "assistant"),
+            content=message_data.get("content"),
+            tool_calls=tool_calls or None,
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+            refusal=None,
+        )
+        usage_data = response.get("usage") or {}
+        return types.SimpleNamespace(
+            id=response.get("id", "m"),
+            model="test-model",
+            choices=[
+                types.SimpleNamespace(
+                    index=choice_data.get("index", 0),
+                    message=message,
+                    finish_reason=choice_data.get("finish_reason", "stop"),
+                )
+            ],
+            usage=types.SimpleNamespace(**usage_data),
+        )
 
 
 def _tc_resp(name: str, args: str = "{}") -> dict:
@@ -421,18 +612,14 @@ def _text_resp(text: str) -> dict:
 
 @pytest.fixture()
 def wire_env():
-    """Mock provider + isolated HERMES_HOME + a shared SessionDB.
+    """In-memory API boundary + isolated HERMES_HOME + shared SessionDB.
 
     Yields (make_agent, handler, db, sid): ``make_agent()`` builds a fresh
     AIAgent bound to the shared DB/session, so a second call models a
     process-restart turn N+1 that reloads history from the store.
     """
-    _MockHandler.captured_requests = []
-    _MockHandler.response_queue = []
-    srv = HTTPServer(("127.0.0.1", 0), _MockHandler)
-    port = srv.server_address[1]
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    _MockProvider.captured_requests = []
+    _MockProvider.response_queue = []
 
     test_home = tempfile.mkdtemp(prefix="hermes_api_content_")
     os.makedirs(os.path.join(test_home, ".hermes"))
@@ -448,13 +635,17 @@ def wire_env():
 
     def make_agent():
         agent = AIAgent(
-            api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test-key", base_url="https://in-memory.invalid/v1",
             provider="openai-compat", model="test-model",
             max_iterations=10, enabled_toolsets=[],
             quiet_mode=True, skip_context_files=True, skip_memory=True,
             save_trajectories=False, platform="cli",
             session_db=db, session_id=sid,
         )
+        client = MagicMock(name="capturing-openai-client")
+        client.chat.completions.create.side_effect = _MockProvider.create
+        agent.client = client
+        agent._model_supports_vision = lambda: True
         agent.valid_tool_names = {"read_file"}
         return agent
 
@@ -465,9 +656,8 @@ def wire_env():
                 [{"context": "PLUGIN-CTX"}] if hook == "pre_llm_call" else []
             ),
         ):
-            yield make_agent, _MockHandler, db, sid
+            yield make_agent, _MockProvider, db, sid
     finally:
-        srv.shutdown()
         db.close()
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
@@ -545,6 +735,102 @@ class TestWireInvariant:
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"] == "second question\n\nPLUGIN-CTX"
+
+    def test_multimodal_afk_replay_is_historical_and_current_status_is_fresh(
+        self, wire_env
+    ):
+        """Structured sidecars preserve the first-wire bytes without putting
+        an AFK note into caller-owned or clean durable content."""
+        from agent import afk
+
+        make_agent, handler, db, sid = wire_env
+        old_timestamp = "2026-08-25T10:00:00+00:00"
+        new_timestamp = "2026-08-25T11:00:00+00:00"
+        afk.state_path().write_text(
+            json.dumps(
+                {"engaged_at": old_timestamp, "reason": "SECRET-OLD-REASON"}
+            ),
+            encoding="utf-8",
+        )
+        original = [
+            {"type": "text", "text": "describe this image"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            },
+        ]
+        caller_snapshot = copy.deepcopy(original)
+
+        agent1 = make_agent()
+        agent1.run_conversation(
+            original, conversation_history=[], task_id="afk-multimodal-1"
+        )
+        first_request = _chat_requests(handler)[0]
+        first_user = _user_messages(first_request)[0]
+        first_wire_content = copy.deepcopy(first_user["content"])
+        first_wire_bytes = json.dumps(
+            first_wire_content, ensure_ascii=False, separators=(",", ":")
+        )
+
+        assert original == caller_snapshot
+        assert first_wire_content[:-1] == caller_snapshot
+        assert old_timestamp in first_wire_content[-1]["text"]
+        assert "Availability at receipt time" in first_wire_content[-1]["text"]
+        assert "SECRET-OLD-REASON" not in json.dumps(first_request)
+        assert all("api_content" not in msg for msg in first_request["messages"])
+
+        history = db.get_messages_as_conversation(sid)
+        historical_user = next(msg for msg in history if msg["role"] == "user")
+        assert historical_user["api_content"] == first_wire_content
+        assert historical_user["api_content"] is not first_wire_content
+        assert "Availability at receipt time" not in str(
+            historical_user["content"]
+        )
+        assert "SECRET-OLD-REASON" not in str(historical_user["content"])
+
+        afk.state_path().write_text(
+            json.dumps(
+                {"engaged_at": new_timestamp, "reason": "SECRET-NEW-REASON"}
+            ),
+            encoding="utf-8",
+        )
+        handler.captured_requests = []
+        agent2 = make_agent()
+        agent2.run_conversation(
+            "second question",
+            conversation_history=history,
+            task_id="afk-multimodal-2",
+        )
+        replay_request = _chat_requests(handler)[0]
+        replay_users = _user_messages(replay_request)
+        replay_wire_bytes = json.dumps(
+            replay_users[0]["content"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        assert replay_wire_bytes == first_wire_bytes
+        assert replay_users[0]["content"] == first_wire_content
+        assert old_timestamp in replay_users[0]["content"][-1]["text"]
+        assert new_timestamp in replay_users[-1]["content"]
+        assert old_timestamp not in replay_users[-1]["content"]
+        assert "SECRET-OLD-REASON" not in json.dumps(replay_request)
+        assert "SECRET-NEW-REASON" not in json.dumps(replay_request)
+        assert all("api_content" not in msg for msg in replay_request["messages"])
+
+        first_system = [
+            msg["content"]
+            for msg in first_request["messages"]
+            if msg.get("role") == "system"
+        ]
+        replay_system = [
+            msg["content"]
+            for msg in replay_request["messages"]
+            if msg.get("role") == "system"
+        ]
+        assert replay_system == first_system
+        roles = [msg.get("role") for msg in replay_request["messages"]]
+        assert all(left != right for left, right in zip(roles, roles[1:]))
 
 
 # ---------------------------------------------------------------------------

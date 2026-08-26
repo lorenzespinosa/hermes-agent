@@ -293,7 +293,17 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
     # are small enough to show in full. Otherwise (gateway, script, batch,
     # no listener) stage instead of forcing a blind deny.
     if _interactive_approval_available():
-        granted = _prompt_inline_memory_approval(inline_summary, inline_detail)
+        granted, availability_denial = _prompt_inline_memory_approval(
+            inline_summary, inline_detail
+        )
+        if availability_denial is not None:
+            return GateDecision(
+                blocked=True,
+                message=(
+                    availability_denial.get("reason")
+                    or "Memory write denied because availability is unknown."
+                ),
+            )
         if granted is True:
             return GateDecision(allow=True)
         if granted is False:
@@ -334,11 +344,16 @@ def _interactive_approval_available() -> bool:
         return False
 
 
-def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
+def _prompt_inline_memory_approval(
+    summary: str, detail: str
+) -> tuple[Optional[bool], Optional[dict]]:
     """Prompt the user inline to approve a memory write.
 
-    Returns True (approved), False (denied), or None (no interactive prompt
-    available / prompt failed → caller should stage instead).
+    Returns ``(decision, availability_denial)``. ``decision`` is True
+    (approved), False (user denied), or None (no interactive prompt available
+    / prompt failed → caller should stage instead). The second item carries
+    an automatic AFK/unreadable-state denial so the caller never misattributes
+    it to the user.
 
     Reuses the per-thread CLI approval callback registered for dangerous
     commands (``tools.terminal_tool.set_approval_callback``). The callback is
@@ -350,13 +365,13 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
     try:
         from tools.terminal_tool import _get_approval_callback
     except Exception:
-        return None
+        return None, None
 
     callback = _get_approval_callback()
     if callback is None:
         # No interactive channel on this thread — stage rather than risk the
         # input() fallback (deadlock under prompt_toolkit, EOF-deny in tests).
-        return None
+        return None, None
 
     header = summary.strip() or "Save to memory?"
     body = detail.strip()
@@ -366,19 +381,35 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
     # that wrapper swallows callback exceptions into "deny", which would
     # silently refuse the write. Direct invocation lets a crashed prompt fall
     # back to staging (the gate only ever delays a write, never drops it).
+    from tools.approval import approval_presentation_denial
+
+    presentation_denial = approval_presentation_denial()
+    if presentation_denial is not None:
+        return None, presentation_denial
     try:
         choice = callback(command, description, allow_permanent=False)
     except Exception as e:
         logger.error("Inline memory approval prompt failed: %s", e)
-        return None
+        return None, None
 
     if choice in {"once", "session"}:
-        return True
+        from tools.approval import _finalize_interactive_authorization
+
+        authorization = _finalize_interactive_authorization(choice)
+        if authorization["authorized"]:
+            return True, None
+        availability_denial = (
+            authorization
+            if authorization.get("afk_denied")
+            or authorization.get("availability_denied")
+            else None
+        )
+        return False, availability_denial
     if choice == "deny":
-        return False
+        return False, None
     # Any other outcome (e.g. timeout that returns "deny" already handled) →
     # treat unknown as no-decision so we stage rather than silently drop.
-    return None
+    return None, None
 
 
 # ---------------------------------------------------------------------------

@@ -897,11 +897,22 @@ def _request_protected_instruction_approval(
             return blocked.format(
                 why="requires approval but the approval request could not "
                     "be delivered.")
+        if decision.get("afk_denied") or decision.get("availability_denied"):
+            return blocked.format(
+                why=(decision.get("reason") or
+                     "availability could not be verified before presentation.")
+            )
         choice = decision.get("choice")
         if decision.get("resolved") and choice in {"once", "session", "always"}:
             # One-operation grant regardless of the tapped scope — nothing
             # is persisted for this gate.
-            return None
+            authorization = _approval._finalize_interactive_authorization(choice)
+            if authorization["authorized"]:
+                return None
+            return blocked.format(
+                why=(authorization.get("reason") or
+                     "availability could not be verified at authorization time.")
+            )
         if not decision.get("resolved"):
             return blocked.format(
                 why="approval prompt timed out without a user response. "
@@ -923,9 +934,23 @@ def _request_protected_instruction_approval(
             allow_session=False,
             approval_callback=callback,
         )
+        presentation_denial = (
+            _approval.approval_presentation_denial_for_choice(choice)
+        )
+        if presentation_denial is not None:
+            return blocked.format(
+                why=(presentation_denial.get("reason") or
+                     "availability could not be verified before presentation.")
+            )
         if choice in {"once", "session", "always"}:
             # One-operation grant; never persisted (see docstring).
-            return None
+            authorization = _approval._finalize_interactive_authorization(choice)
+            if authorization["authorized"]:
+                return None
+            return blocked.format(
+                why=(authorization.get("reason") or
+                     "availability could not be verified at authorization time.")
+            )
         if choice == "timeout":
             return blocked.format(
                 why="approval prompt timed out without a user response. "

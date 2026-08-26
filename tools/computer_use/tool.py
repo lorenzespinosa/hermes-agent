@@ -644,19 +644,44 @@ def _request_approval(action: str, args: Dict[str, Any],
         # one layer out via the normal tool-approval infra.
         return None
     summary = _summarize_action(action, args)
+    from tools.approval import approval_presentation_denial
+
+    presentation_denial = approval_presentation_denial()
+    if presentation_denial is not None:
+        return json.dumps({
+            "error": presentation_denial.get("reason")
+            or "availability denied approval",
+            "action": action,
+        })
     try:
         verdict = cb(action, args, summary)
     except Exception as e:
         logger.warning("approval callback failed: %s", e)
         verdict = "deny"
-    if verdict == "approve_once":
-        return None
-    if verdict == "approve_session" or verdict == "always_approve":
-        with _approval_lock:
-            _always_allow.setdefault(session_id, set()).add(scope_key)
-            if verdict == "always_approve":
-                _session_auto_approve[session_id] = True
-        return None
+    choice = {
+        "approve_once": "once",
+        "approve_session": "session",
+        "always_approve": "always",
+    }.get(verdict)
+    if choice is not None:
+        from tools.approval import _finalize_interactive_authorization
+
+        def _persist_choice() -> None:
+            if verdict in {"approve_session", "always_approve"}:
+                with _approval_lock:
+                    _always_allow.setdefault(session_id, set()).add(scope_key)
+                    if verdict == "always_approve":
+                        _session_auto_approve[session_id] = True
+
+        authorization = _finalize_interactive_authorization(
+            choice, _persist_choice
+        )
+        if authorization["authorized"]:
+            return None
+        return json.dumps({
+            "error": authorization.get("reason") or "availability denied approval",
+            "action": action,
+        })
     if verdict == "timeout":
         return json.dumps({
             "error": (

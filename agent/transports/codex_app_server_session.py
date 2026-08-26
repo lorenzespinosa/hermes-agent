@@ -1079,9 +1079,19 @@ class CodexAppServerSession:
             description += f" — {reason}"
         if self._approval_callback is not None:
             try:
+                from tools.approval import (
+                    _finalize_interactive_authorization,
+                    approval_presentation_denial,
+                )
+
+                if approval_presentation_denial() is not None:
+                    return "decline"
                 choice = self._approval_callback(
                     command, description, allow_permanent=False
                 )
+                authorization = _finalize_interactive_authorization(choice)
+                if not authorization["authorized"]:
+                    return "decline"
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
                 logger.exception("approval_callback raised on exec request")
@@ -1124,11 +1134,21 @@ class CodexAppServerSession:
                 else "apply_patch"
             )
             try:
+                from tools.approval import (
+                    _finalize_interactive_authorization,
+                    approval_presentation_denial,
+                )
+
+                if approval_presentation_denial() is not None:
+                    return "decline"
                 choice = self._approval_callback(
                     command_label,
                     description,
                     allow_permanent=False,
                 )
+                authorization = _finalize_interactive_authorization(choice)
+                if not authorization["authorized"]:
+                    return "decline"
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
                 logger.exception("approval_callback raised on apply_patch")

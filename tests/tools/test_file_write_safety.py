@@ -4,6 +4,7 @@ Based on PR #1085 by ismoilh (salvaged).
 """
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -487,6 +488,86 @@ class TestProtectedInstructionFiles:
         res = self._write(target)
         assert res.get("error") and "BLOCKED" in res["error"]
         assert not target.exists()
+
+    @pytest.mark.parametrize("afk_timing", ["before-presentation", "mid-prompt"])
+    def test_afk_suppresses_or_withdraws_protected_file_approval(
+        self, tmp_path, monkeypatch, afk_timing
+    ):
+        from agent import afk
+        from tools.terminal_tool import set_approval_callback
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        target = tmp_path / "AGENTS.md"
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        callback_count = 0
+
+        def cb(_command, _description, **_kwargs):
+            nonlocal callback_count
+            callback_count += 1
+            callback_entered.set()
+            assert release_callback.wait(timeout=5)
+            return "once"
+
+        outcome = {}
+        done = threading.Event()
+
+        def write():
+            set_approval_callback(cb)
+            try:
+                outcome["result"] = self._write(target, "must not persist")
+            except BaseException as exc:  # pragma: no cover - failure detail
+                outcome["error"] = exc
+            finally:
+                set_approval_callback(None)
+                done.set()
+
+        try:
+            if afk_timing == "before-presentation":
+                afk.engage(reason="already away")
+            thread = threading.Thread(target=write, daemon=True)
+            thread.start()
+            if afk_timing == "mid-prompt":
+                assert callback_entered.wait(timeout=5)
+                afk.engage(reason="protected-file prompt still open")
+                release_callback.set()
+
+            assert done.wait(timeout=5)
+            thread.join(timeout=1)
+            assert "error" not in outcome, outcome.get("error")
+            assert callback_count == (1 if afk_timing == "mid-prompt" else 0)
+            assert outcome["result"]["error"].find(afk.APPROVAL_DENY_REASON) >= 0
+            assert not target.exists()
+        finally:
+            release_callback.set()
+            set_approval_callback(None)
+
+    def test_gateway_afk_denial_is_automatic_not_attributed_to_user(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import afk
+        from tools import approval
+        from tools.file_tools import _request_protected_instruction_approval
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        session = "protected-file-afk-gateway"
+        notifications = []
+        approval.register_gateway_notify(
+            session, lambda data: notifications.append(dict(data))
+        )
+        token = approval.set_current_session_key(session)
+        try:
+            afk.engage(reason="already away")
+            result = _request_protected_instruction_approval(["AGENTS.md"])
+        finally:
+            approval.reset_current_session_key(token)
+            approval.unregister_gateway_notify(session)
+            approval.clear_session(session)
+
+        assert notifications == []
+        assert result is not None
+        assert afk.APPROVAL_DENY_REASON in result
+        assert "denied by the user" not in result
 
     def test_config_disabled_skips_gate(self, tmp_path, approvals, monkeypatch):
         import tools.file_tools as ft

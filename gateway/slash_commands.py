@@ -141,6 +141,17 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    # ------------------------------------------------------------------
+    # /afk — operator availability
+    # ------------------------------------------------------------------
+    #
+    async def _handle_afk_command(self, event: MessageEvent) -> str:
+        """Run the shared CLI/TUI/gateway AFK grammar off the event loop."""
+        from agent import afk
+
+        args = (event.get_command_args() or "").strip()
+        return await asyncio.to_thread(afk.handle_command, args)
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source

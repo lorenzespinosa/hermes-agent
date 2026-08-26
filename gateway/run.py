@@ -5883,7 +5883,6 @@ class TurnRunner:
         agent._gateway_turn_context_notes = "\n\n".join(
             self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         )
-
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
         _bg_review_pending_lock = threading.Lock()
@@ -6356,7 +6355,10 @@ class TurnRunner:
 
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
-        register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        register_gateway_notify(
+            _approval_session_key,
+            _approval_notify_sync,
+        )
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -16759,6 +16761,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
+                # Stepping away WHILE the agent is working is the common
+                # case, so /afk must reach its handler mid-run.
+                "afk": self._handle_afk_command,
                 "agents": self._handle_agents_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
@@ -17878,6 +17883,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "pause":
             return await self._handle_pause_command(event)
+
+        if canonical == "afk":
+            return await self._handle_afk_command(event)
 
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
@@ -21537,10 +21545,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``enabled=False`` and this method always returns None.
         """
         from gateway.slash_access import policy_for_source as _policy_for_source
+        from hermes_cli.commands import resolve_command as _resolve_command
 
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
+        command_def = _resolve_command(canonical_cmd)
+        if command_def is not None and command_def.admin_only:
+            # Machine-global/security-sensitive mutations are the one narrow
+            # exception to legacy "no admin list means unrestricted" behavior.
+            # An explicit scope admin must authorize them; a guest command
+            # allowlist cannot turn status/absence into authority.
+            if policy.enabled and policy.is_admin(source.user_id):
+                return None
+            logger.info(
+                "Admin-only slash command /%s denied for %s:%s because no "
+                "explicit scope admin authorization matched",
+                canonical_cmd,
+                source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            return (
+                f"⛔ /{canonical_cmd} requires an explicitly configured "
+                "gateway administrator. Configure allow_admin_from for DMs "
+                "or group_allow_admin_from for groups/channels."
+            )
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(

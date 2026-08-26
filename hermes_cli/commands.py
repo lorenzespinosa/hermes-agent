@@ -95,6 +95,10 @@ class CommandDef:
     subcommands: tuple[str, ...] = ()  # tab-completable subcommands
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
+    # Gateway mutation with machine-global/security impact. Unlike legacy
+    # slash gating, this requires an explicitly configured scope admin list;
+    # user_allowed_commands and disabled gating cannot authorize it.
+    admin_only: bool = False
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
     # Mid-run (agent busy) gateway behavior.  Drives the Guard-2 dispatcher
     # in gateway/run.py (_dispatch_busy_slash_command) instead of a
@@ -184,6 +188,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="interrupt_then_dispatch", busy_handler="stop"),
     CommandDef("pause", "Pause new work globally (emergency stop); '/pause off' resumes", "Session",
                gateway_only=True, args_hint="[reason | off]",
+               busy_policy="dispatch"),
+    CommandDef("afk", "Mark yourself away from the keyboard so turns know you're not there to answer", "Session",
+               args_hint="[on [reason] | off | status]", admin_only=True,
+               subcommands=("on", "off", "back", "return", "status"),
                busy_policy="dispatch"),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]", busy_policy="dispatch"),
@@ -1368,7 +1376,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - afk: availability marker; reached via /hermes afk on Slack — and, far
+#     more usefully, as `!afk` (Slack blocks native slashes inside threads,
+#     which is exactly where someone announces they're stepping away). Added
+#     at the 50-cap, so a native slot would clamp an existing native slash;
+#     Slack also ships a built-in /away, so a native /afk would sit confusingly
+#     next to it.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "afk"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

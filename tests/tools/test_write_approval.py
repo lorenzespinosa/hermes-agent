@@ -9,8 +9,9 @@ subcommand dispatch.
 
 import json
 import os
-import tempfile
 import shutil
+import tempfile
+import threading
 
 import pytest
 
@@ -250,6 +251,67 @@ def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
     assert "denied" in r["error"].lower()
     assert store.memory_entries == []
     assert wa.pending_count("memory") == 0  # denied, not staged
+
+
+@pytest.mark.parametrize("afk_timing", ["before-presentation", "mid-prompt"])
+def test_memory_inline_approval_obeys_afk_presentation_and_finalization(
+    hermes_home, approval_callback_cleanup, afk_timing
+):
+    from agent import afk
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore, memory_tool
+    from tools.terminal_tool import set_approval_callback
+
+    _set_approval("memory", True)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_count = 0
+
+    def approve_cb(_command, _description, **_kwargs):
+        nonlocal callback_count
+        callback_count += 1
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        return "once"
+
+    store = MemoryStore()
+    store.load_from_disk()
+    outcome = {}
+    done = threading.Event()
+
+    def write():
+        set_approval_callback(approve_cb)
+        try:
+            outcome["result"] = memory_tool(
+                "add", "memory", "must not persist", store=store
+            )
+        except BaseException as exc:  # pragma: no cover - failure detail
+            outcome["error"] = exc
+        finally:
+            set_approval_callback(None)
+            done.set()
+
+    try:
+        if afk_timing == "before-presentation":
+            afk.engage(reason="already away")
+        thread = threading.Thread(target=write, daemon=True)
+        thread.start()
+        if afk_timing == "mid-prompt":
+            assert callback_entered.wait(timeout=5)
+            afk.engage(reason="memory prompt still open")
+            release_callback.set()
+
+        assert done.wait(timeout=5)
+        thread.join(timeout=1)
+        assert "error" not in outcome, outcome.get("error")
+        assert callback_count == (1 if afk_timing == "mid-prompt" else 0)
+        result = json.loads(outcome["result"])
+        assert result["success"] is False
+        assert result["error"] == afk.APPROVAL_DENY_REASON
+        assert store.memory_entries == []
+        assert wa.pending_count("memory") == 0
+    finally:
+        release_callback.set()
 
 
 def test_memory_invalid_params_rejected_before_staging(hermes_home):

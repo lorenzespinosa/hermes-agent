@@ -3629,6 +3629,15 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     count = 0
     content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(msg, dict):
+        from agent.turn_context import is_api_content_sidecar
+
+        sidecar = msg.get("api_content")
+        if (
+            is_api_content_sidecar(sidecar)
+            and msg.get("role") in ("user", "assistant")
+        ):
+            content = sidecar
     if isinstance(content, list):
         for part in content:
             if not isinstance(part, dict):
@@ -3651,6 +3660,26 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
+def _content_without_image_payloads(content: Any) -> Any:
+    """Mirror the wire content while removing separately-charged image data."""
+    if isinstance(content, list):
+        cleaned = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") in {"image", "image_url", "input_image"}:
+                    cleaned.append(
+                        {"type": part.get("type"), "image": "[stripped]"}
+                    )
+                else:
+                    cleaned.append(part)
+            else:
+                cleaned.append(part)
+        return cleaned
+    if isinstance(content, dict) and content.get("_multimodal"):
+        return content.get("text_summary", "")
+    return content
+
+
 def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
@@ -3663,7 +3692,8 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
       from its clean stored content (2.00x on a 40KB sidecar).
 
       The substitution mirrors that helper's guard exactly: only a non-empty
-      STRING sidecar on a ``user``/``assistant`` row displaces ``content``.
+      string or multimodal-list sidecar on a ``user``/``assistant`` row
+      displaces ``content``.
       Any other sidecar shape is popped and discarded on the wire without
       touching ``content``, so a shadow that substituted unconditionally
       would UNDERcount those rows — the dangerous direction, since it makes
@@ -3673,10 +3703,11 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
       raw chars here would massively overestimate usage.
     """
     sidecar = msg.get("api_content")
-    sidecar_wins = (
-        isinstance(sidecar, str)
-        and bool(sidecar)
-        and msg.get("role") in ("user", "assistant")
+    from agent.turn_context import is_api_content_sidecar
+
+    sidecar_wins = is_api_content_sidecar(sidecar) and msg.get("role") in (
+        "user",
+        "assistant",
     )
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
@@ -3686,28 +3717,14 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
             # Always popped before the request is built; only counted when it
             # actually replaces ``content``.
             if sidecar_wins:
-                shadow["content"] = v
+                shadow["content"] = _content_without_image_payloads(v)
             continue
         if k == "content":
             if sidecar_wins:
                 # The sidecar wins on the wire; skip the clean copy so the
                 # same logical content is not counted twice.
                 continue
-            if isinstance(v, list):
-                cleaned = []
-                for part in v:
-                    if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
-                            cleaned.append({"type": part.get("type"), "image": "[stripped]"})
-                        else:
-                            cleaned.append(part)
-                    else:
-                        cleaned.append(part)
-                shadow[k] = cleaned
-            elif isinstance(v, dict) and v.get("_multimodal"):
-                shadow[k] = v.get("text_summary", "")
-            else:
-                shadow[k] = v
+            shadow[k] = _content_without_image_payloads(v)
         else:
             shadow[k] = v
     return shadow
