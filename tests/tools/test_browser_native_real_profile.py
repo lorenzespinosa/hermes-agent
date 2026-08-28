@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -253,13 +254,7 @@ def test_native_browser_exec_uses_only_supervisor_endpoint_and_sanitized_env(
     env = captured["env"]
     assert env["BU_CDP_URL"] == client.cdp_url
     assert env["BU_NAME"].startswith("hermes_native_")
-    assert len(env["BU_NAME"]) <= 30
-    assert env["BU_NAME"] == browser_use._native_daemon_session_name(
-        "work", client.hermes_home, client.runtime_namespace
-    )
-    assert env["BU_NAME"] != browser_use._native_daemon_session_name(
-        "work", client.hermes_home, "generation-8"
-    )
+    assert "generation-7" in env["BU_NAME"]
     for key in (
         "BU_CDP_WS",
         "BROWSER_CDP_URL",
@@ -287,6 +282,25 @@ def test_native_browser_exec_uses_only_supervisor_endpoint_and_sanitized_env(
         "BU_NAME",
         "BH_AGENT_WORKSPACE",
     }
+
+
+def test_native_daemon_name_fits_default_macos_unix_socket_path():
+    import tools.browser_use_cli as browser_use
+
+    name = browser_use._native_daemon_session_name(
+        "acceptance",
+        "/Users/lorenzleslie/.hermes",
+        "generation-1234567890abcdef",
+    )
+    socket_path = (
+        Path.home()
+        / ".config"
+        / "browser-harness"
+        / "runtime"
+        / f"bu-{name}.sock"
+    )
+
+    assert len(os.fsencode(socket_path)) <= 103
 
 
 def test_native_browser_exec_releases_client_on_subprocess_timeout(monkeypatch):
@@ -394,8 +408,7 @@ def test_concurrent_native_browser_exec_calls_hold_independent_clients(
     assert all(result["success"] is True for result in results)
     assert len(captured_envs) == 2
     assert len({env["BU_NAME"] for env in captured_envs}) == 2
-    assert all(env["BU_NAME"].startswith("hermes_native_") for env in captured_envs)
-    assert all(len(env["BU_NAME"]) <= 30 for env in captured_envs)
+    assert all("generation-share" in env["BU_NAME"] for env in captured_envs)
     assert {call.args[0].token for call in supervisor.release.call_args_list} == {
         "client-0",
         "client-1",
@@ -453,8 +466,12 @@ def test_new_runtime_generation_gets_new_native_daemon_namespace(monkeypatch, tm
     assert second["success"] is True
     assert len(names) == 2
     assert names[0] != names[1]
-    assert all(name.startswith("hermes_native_") for name in names)
-    assert all(len(name) <= 30 for name in names)
+    assert names[0] == browser_use._native_daemon_session_name(
+        "work", str(tmp_path), "generation-before-restart"
+    )
+    assert names[1] == browser_use._native_daemon_session_name(
+        "work", str(tmp_path), "generation-after-restart"
+    )
 
 
 def test_launch_persists_launching_then_ready_with_one_generation(monkeypatch, tmp_path):

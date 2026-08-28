@@ -37,16 +37,34 @@ _NATIVE_SESSION_PREFIX = "hermes_native_"
 def _native_daemon_session_name(
     requested: str, hermes_home: str, runtime_generation: str
 ) -> str:
-    """Bind the Browser Use daemon to one native Chrome generation.
-
-    Keep the internal daemon name short enough for macOS AF_UNIX socket paths.
-    The digest still binds the full generation, home, and requested session.
-    """
+    """Bind the Browser Use daemon to one native Chrome generation."""
     material = (
-        f"{hermes_home}\0{requested or 'default'}\0{runtime_generation}".encode("utf-8")
+        f"{hermes_home}\0{requested or 'default'}\0{runtime_generation}"
+    ).encode("utf-8")
+    suffix = hashlib.sha256(material).hexdigest()[:12]
+    # browser-harness stores ``bu-<BU_NAME>.sock`` below its default runtime
+    # directory. macOS AF_UNIX paths are limited to 104 bytes including the
+    # terminator, so budget the generation fragment against the actual home.
+    socket_base = (
+        Path.home()
+        / ".config"
+        / "browser-harness"
+        / "runtime"
+        / "bu-.sock"
     )
-    suffix = hashlib.sha256(material).hexdigest()[:16]
-    return f"{_NATIVE_SESSION_PREFIX}{suffix}"
+    max_name_bytes = min(64, 103 - len(os.fsencode(socket_base)))
+    fixed_bytes = len(_NATIVE_SESSION_PREFIX) + len(suffix)
+    if max_name_bytes < fixed_bytes:
+        raise ValueError(
+            "The default Browser Use runtime path exceeds the macOS AF_UNIX budget."
+        )
+    generation_budget = max_name_bytes - fixed_bytes - 1
+    generation = re.sub(r"[^A-Za-z0-9_-]", "_", runtime_generation)[
+        : max(0, generation_budget)
+    ]
+    if not generation:
+        return f"{_NATIVE_SESSION_PREFIX}{suffix}"
+    return f"{_NATIVE_SESSION_PREFIX}{generation}_{suffix}"
 
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
