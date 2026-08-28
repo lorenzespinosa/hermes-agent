@@ -601,6 +601,16 @@ DEFAULT_CONFIG = {
         # real-profile local session even under a cloud browser backend. Toggle
         # in the desktop Settings → Browser section.
         "use_real_profile": False,
+        # macOS-only, fail-closed stable-Chrome lane. This is deliberately a
+        # second opt-in layered on use_real_profile: absent/false preserves the
+        # established packaged-browser behavior exactly. When enabled,
+        # browser.backend must be browser-use, the provider must be local, all
+        # selectors below are mandatory, and no cloud/CDP/default fallback is
+        # permitted. Initial acceptance is headed only.
+        "real_profile_macos_native": False,
+        "real_profile_source_browser": "",
+        "real_profile_source_profile": "",
+        "real_profile_expected_account": "",
         # When real-profile browsing needs the browser closed (Windows: a
         # running Chrome/Edge/Brave locks its cookie DB deny-all, so it must be
         # fully quit before its profile can be copied), arm the "offer to close
