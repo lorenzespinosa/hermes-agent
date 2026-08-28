@@ -35,7 +35,10 @@ _NATIVE_SESSION_PREFIX = "hermes_native_"
 
 
 def _native_daemon_session_name(
-    requested: str, hermes_home: str, runtime_generation: str
+    requested: str,
+    hermes_home: str,
+    runtime_generation: str,
+    subprocess_home: str,
 ) -> str:
     """Bind the Browser Use daemon to one native Chrome generation."""
     material = (
@@ -45,8 +48,11 @@ def _native_daemon_session_name(
     # browser-harness stores ``bu-<BU_NAME>.sock`` below its default runtime
     # directory. macOS AF_UNIX paths are limited to 104 bytes including the
     # terminator, so budget the generation fragment against the actual home.
+    child_home = Path(subprocess_home)
+    if not subprocess_home or not child_home.is_absolute():
+        raise ValueError("Browser Use requires an absolute subprocess HOME.")
     socket_base = (
-        Path.home()
+        child_home
         / ".config"
         / "browser-harness"
         / "runtime"
@@ -862,7 +868,10 @@ def _browser_exec_native(
         env = _native_subprocess_env()
         env["BU_CDP_URL"] = client.cdp_url
         env["BU_NAME"] = _native_daemon_session_name(
-            session, client.hermes_home, client.runtime_namespace
+            session,
+            client.hermes_home,
+            client.runtime_namespace,
+            env.get("HOME", ""),
         )
         if workspace:
             env["BH_AGENT_WORKSPACE"] = workspace
