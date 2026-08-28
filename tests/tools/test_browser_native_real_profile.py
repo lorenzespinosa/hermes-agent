@@ -833,6 +833,66 @@ def test_failed_final_durable_adoption_restores_generation_cleanup(
             adopted.lock.release()
 
 
+def test_stale_durable_adoption_retains_lease_when_listener_absence_is_ambiguous(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.native_real_profile as native
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    canonical_home, snapshot, root = native._profile_scope(home)
+    root.parent.mkdir(parents=True, mode=0o700)
+    root.parent.chmod(0o700)
+    root.mkdir(mode=0o700)
+    lock = native.NativeProfileLock(str(root)).acquire()
+    lock_device, lock_inode = lock.identity
+    runtime = native._NativeRuntime(
+        process=SimpleNamespace(pid=999999),
+        process_start_time=100.0,
+        cdp_url="http://127.0.0.1:43123",
+        cdp_port=43123,
+        snapshot_uuid="snapshot-1",
+        executable_fingerprint="f" * 64,
+        lock=lock,
+        hermes_home=canonical_home,
+        snapshot_path=str(snapshot),
+        supervisor_path=str(root),
+        source_profile_hash="source-hash",
+        expected_account_hash="account-hash",
+        lease_path=str(root / "runtime.json"),
+        runtime_generation="generation-stale-listener",
+        lock_device=lock_device,
+        lock_inode=lock_inode,
+    )
+    native._write_runtime_lease(runtime)
+    lock.release()
+    monkeypatch.setattr(native, "_validate_stable_chrome", lambda: "f" * 64)
+    monkeypatch.setattr(native, "_runtime_is_valid", lambda *_args: False)
+    monkeypatch.setattr(native, "_refresh_provisional_runtime", lambda *_args: False)
+    monkeypatch.setattr(
+        native,
+        "_prove_recorded_runtime",
+        Mock(side_effect=native.NativeProfileError("native_cached_proof_failed", "stale")),
+    )
+    monkeypatch.setattr(native, "_recorded_process_is_absent", lambda _runtime: True)
+    monkeypatch.setattr(native, "_recorded_listener_is_absent", lambda _port: False)
+    monkeypatch.setattr(
+        native, "_processes_owning_data_dir", lambda *_args, **_kwargs: []
+    )
+    provision = Mock(side_effect=AssertionError("ambiguous listener must block provisioning"))
+    monkeypatch.setattr(native, "provision_native_snapshot", provision)
+    launch = Mock(side_effect=AssertionError("ambiguous listener must block relaunch"))
+    monkeypatch.setattr(native.subprocess, "Popen", launch)
+
+    with pytest.raises(native.NativeProfileError) as raised:
+        native.NativeProfileSupervisor.for_profile(home).acquire(_NATIVE_CONFIG, {})
+
+    assert raised.value.code == "native_cached_proof_failed"
+    assert (root / "runtime.json").exists()
+    provision.assert_not_called()
+    launch.assert_not_called()
+
+
 def test_native_browser_exec_never_consults_or_publishes_builtin_session_cache(
     monkeypatch,
 ):

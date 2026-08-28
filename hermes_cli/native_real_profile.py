@@ -3089,6 +3089,11 @@ def _resolve_native_profile_cdp(
                             "native_cached_proof_failed",
                             "A persisted native browser owner could not be proven.",
                         ) from proof_error
+                    if not _recorded_listener_is_absent(persisted.cdp_port):
+                        raise NativeProfileError(
+                            "native_cached_proof_failed",
+                            "A persisted native browser listener could not be proven absent.",
+                        ) from proof_error
                     if snapshot.exists() and _processes_owning_data_dir(str(snapshot)):
                         raise NativeProfileError(
                             "native_snapshot_owned",
