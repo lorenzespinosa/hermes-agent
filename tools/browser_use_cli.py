@@ -179,9 +179,10 @@ def _floor_subprocess_path(path: str) -> str:
 def _read_browser_cfg(*, fail_closed: bool = False) -> dict:
     """Return ``browser:`` config, optionally surfacing read failures."""
     try:
-        from hermes_cli.config import cfg_get, read_raw_config
+        from hermes_cli.config import cfg_get, read_raw_config, read_raw_config_strict
 
-        cfg = cfg_get(read_raw_config(), "browser", default={})
+        raw = read_raw_config_strict() if fail_closed else read_raw_config()
+        cfg = cfg_get(raw, "browser", default={})
         return cfg if isinstance(cfg, dict) else {}
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)

@@ -1554,13 +1554,20 @@ def _query_lsof_listener_owners(port: int) -> tuple[int, ...] | None:
         check=False,
         env={"LC_ALL": "C", "LANG": "C"},
     )
-    if (
-        completed.returncode != 0
-        or completed.stderr != b""
-        or not isinstance(completed.stdout, bytes)
-    ):
+    if not isinstance(completed.stdout, bytes) or completed.stderr != b"":
+        return None
+    if completed.returncode == 1 and completed.stdout == b"":
+        return ()
+    if completed.returncode != 0:
         return None
     return _parse_lsof_listener_owners(completed.stdout, port)
+
+
+def _recorded_listener_is_absent(port: int) -> bool:
+    """Prove no listener remains for a persisted ready-runtime port."""
+    if port == 0:
+        return True
+    return _query_lsof_listener_owners(port) == ()
 
 
 def _listener_is_loopback_only(
@@ -2270,6 +2277,23 @@ def _prove_recorded_runtime(runtime: _NativeRuntime) -> str:
     return final_websocket_url
 
 
+def _native_startup_timeout(value: object) -> float:
+    """Return one finite positive startup wait capped independently of tool time."""
+    try:
+        timeout = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise NativeProfileError(
+            "native_command_timeout_invalid",
+            "Native startup timeout must be a finite positive number.",
+        ) from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise NativeProfileError(
+            "native_command_timeout_invalid",
+            "Native startup timeout must be a finite positive number.",
+        )
+    return min(timeout, 120.0)
+
+
 def _wait_for_native_ready(process: subprocess.Popen, snapshot: Path, timeout: float) -> int:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -2301,6 +2325,11 @@ def _close_recorded_runtime(runtime: _NativeRuntime, *, timeout: float = 10.0) -
             raise NativeProfileError(
                 "native_cleanup_uncertain",
                 "Native root exited but a detached snapshot owner remains.",
+            )
+        if not _recorded_listener_is_absent(runtime.cdp_port):
+            raise NativeProfileError(
+                "native_cleanup_uncertain",
+                "Native root exited but recorded listener absence could not be proven.",
             )
         return
     if not _process_identity_matches(
@@ -2385,6 +2414,11 @@ def _close_recorded_runtime(runtime: _NativeRuntime, *, timeout: float = 10.0) -
     if _probe_cdp(Path(runtime.snapshot_path), runtime.cdp_port):
         raise NativeProfileError(
             "native_cleanup_uncertain", "Native browser cleanup could not prove endpoint absence."
+        )
+    if not _recorded_listener_is_absent(runtime.cdp_port):
+        raise NativeProfileError(
+            "native_cleanup_uncertain",
+            "Native browser cleanup could not prove listener absence.",
         )
     if _processes_owning_data_dir(runtime.snapshot_path):
         raise NativeProfileError(
@@ -3152,10 +3186,7 @@ def _resolve_native_profile_cdp(
                 lock_retained = True
                 _write_runtime_lease(runtime)
                 timeout_value = browser_config.get("command_timeout", 30)
-                try:
-                    timeout = float(str(timeout_value or 30))
-                except (TypeError, ValueError):
-                    timeout = 30.0
+                timeout = _native_startup_timeout(timeout_value)
                 port = _wait_for_native_ready(process, snapshot, timeout)
                 ready_runtime = replace(
                     runtime,
