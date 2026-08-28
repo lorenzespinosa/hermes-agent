@@ -183,7 +183,11 @@ def _read_browser_cfg(*, fail_closed: bool = False) -> dict:
 
         raw = read_raw_config_strict() if fail_closed else read_raw_config()
         cfg = cfg_get(raw, "browser", default={})
-        return cfg if isinstance(cfg, dict) else {}
+        if isinstance(cfg, dict):
+            return cfg
+        if fail_closed:
+            raise ValueError("Browser configuration must be a mapping")
+        return {}
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)
         if fail_closed:
@@ -755,32 +759,42 @@ def _native_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _cleanup_revoked_native_profile(browser_config: Mapping[str, object]) -> str | None:
-    """Delete copied native credentials before any post-revocation launch."""
-    if is_truthy_value(browser_config.get("use_real_profile"), default=False):
-        return None
-
+def _native_profile_state_present() -> bool:
+    """Whether this profile has durable or copied native browser state."""
     from hermes_constants import get_hermes_home
-    from hermes_cli.native_real_profile import NativeProfileSupervisor
 
     state_root = get_hermes_home() / "browser-supervisor" / "native-real-profile"
-    state_present = os.path.lexists(state_root / "snapshot") or os.path.lexists(
+    return os.path.lexists(state_root / "snapshot") or os.path.lexists(
         state_root / "runtime.json"
     )
-    if not is_truthy_value(
+
+
+def _cleanup_revoked_native_profile(browser_config: Mapping[str, object]) -> str | None:
+    """Delete copied native credentials before any post-revocation launch."""
+    from hermes_cli.native_real_profile import NativeProfileSupervisor
+
+    state_present = _native_profile_state_present()
+    real_profile_enabled = is_truthy_value(
+        browser_config.get("use_real_profile"), default=False
+    )
+    native_enabled = is_truthy_value(
         browser_config.get("real_profile_macos_native"), default=False
-    ) and not state_present:
+    )
+    if real_profile_enabled and (native_enabled or not state_present):
+        return None
+    if not native_enabled and not state_present:
         return None
     try:
         NativeProfileSupervisor.for_profile().cleanup(delete_snapshot=True)
     except Exception as exc:
         code_value = getattr(exc, "code", "native_cleanup_failed")
         return (
-            "Native consent is off and copied credentials could not be cleaned "
+            "Native real-profile mode is off or consent is revoked, and copied "
+            "credentials could not be cleaned "
             f"safely [{code_value}]: {exc}"
         )
     return (
-        "Native real-profile consent is off. Copied credentials were removed; "
+        "Native real-profile mode is off or consent is revoked. Copied credentials were removed; "
         "start a new session before using another browser route."
     )
 
@@ -909,24 +923,37 @@ def browser_exec(
             "dashes, or underscores (e.g. 'r7k2')."
         )
 
-    try:
-        browser_config = dict(_read_browser_cfg(fail_closed=True))
-    except Exception as exc:
-        return tool_error(f"Browser configuration is unavailable: {exc}")
-    revocation_error = _cleanup_revoked_native_profile(browser_config)
-    if revocation_error:
-        return tool_error(revocation_error)
-    if is_truthy_value(
+    browser_config = dict(_read_browser_cfg())
+    native_selected = is_truthy_value(
         browser_config.get("real_profile_macos_native"), default=False
-    ):
-        return _browser_exec_native(
-            code=code,
-            session=session,
-            timeout_s=timeout_s,
-            task_id=task_id,
-            browser_config=browser_config,
-        )
+    )
+    if native_selected or _native_profile_state_present():
+        try:
+            browser_config = dict(_read_browser_cfg(fail_closed=True))
+        except Exception as exc:
+            return tool_error(f"Browser configuration is unavailable: {exc}")
+        revocation_error = _cleanup_revoked_native_profile(browser_config)
+        if revocation_error:
+            return tool_error(revocation_error)
+        if is_truthy_value(
+            browser_config.get("real_profile_macos_native"), default=False
+        ):
+            return _browser_exec_native(
+                code=code,
+                session=session,
+                timeout_s=timeout_s,
+                task_id=task_id,
+                browser_config=browser_config,
+            )
 
+    cmd = _find_cli()
+    if not cmd:
+        return tool_error(
+            "browser-use CLI not found on PATH, and uvx is unavailable for a "
+            "zero-install run. Install it with `uv tool install browser-use` "
+            "(or `pipx install browser-use`), then run `browser-use --doctor` "
+            "to verify the setup."
+        )
     env = _base_subprocess_env()
     if session:
         env["BU_NAME"] = session
@@ -938,14 +965,6 @@ def browser_exec(
     rp_err = _resolve_real_profile_cdp(env, force_local=bool(local))
     if rp_err:
         return tool_error(rp_err)
-    cmd = _find_cli()
-    if not cmd:
-        return tool_error(
-            "browser-use CLI not found on PATH, and uvx is unavailable for a "
-            "zero-install run. Install it with `uv tool install browser-use` "
-            "(or `pipx install browser-use`), then run `browser-use --doctor` "
-            "to verify the setup."
-        )
     if local and not (env.get("BU_CDP_URL") or env.get("BU_CDP_WS")):
         # local=True is only served by the real-profile route; anything else
         # (consent off — schema normally hidden, but be explicit; or an

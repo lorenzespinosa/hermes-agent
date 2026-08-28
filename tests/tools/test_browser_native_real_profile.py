@@ -480,7 +480,8 @@ def test_launch_persists_launching_then_ready_with_one_generation(monkeypatch, t
     monkeypatch.setattr(native.subprocess, "Popen", launch)
     monkeypatch.setattr(psutil, "Process", lambda _pid: pinned)
     monkeypatch.setattr(native, "_validate_live_process_signature", lambda _pid: None)
-    monkeypatch.setattr(native, "_wait_for_native_ready", lambda *_args: 43123)
+    wait_for_ready = Mock(return_value=43123)
+    monkeypatch.setattr(native, "_wait_for_native_ready", wait_for_ready)
     monkeypatch.setattr(native, "_runtime_is_valid", lambda *_args: True)
     monkeypatch.setattr(
         native,
@@ -496,7 +497,9 @@ def test_launch_persists_launching_then_ready_with_one_generation(monkeypatch, t
 
     monkeypatch.setattr(native, "_write_runtime_lease", capture_write)
     supervisor = native.NativeProfileSupervisor.for_profile(home)
-    client = supervisor.acquire(_NATIVE_CONFIG, {})
+    client = supervisor.acquire(
+        {**_NATIVE_CONFIG, "command_timeout": 10**100}, {}
+    )
     runtime = native._runtimes[supervisor.hermes_home]
 
     try:
@@ -513,6 +516,9 @@ def test_launch_persists_launching_then_ready_with_one_generation(monkeypatch, t
         assert launch.call_args.kwargs["umask"] == 0o077
         assert launch.call_args.kwargs["start_new_session"] is True
         assert launch.call_args.kwargs["close_fds"] is True
+        wait_for_ready.assert_called_once_with(
+            process, native.Path(runtime.snapshot_path), 120.0
+        )
     finally:
         native._client_leases.pop(supervisor.hermes_home, None)
         native._runtimes.pop(supervisor.hermes_home, None)
@@ -750,6 +756,76 @@ def test_durable_runtime_is_adopted_only_with_complete_live_proof(
             adopted.lock.release()
 
 
+def test_failed_final_durable_adoption_restores_generation_cleanup(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.native_real_profile as native
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    canonical_home, snapshot, root = native._profile_scope(home)
+    root.parent.mkdir(parents=True, mode=0o700)
+    root.parent.chmod(0o700)
+    root.mkdir(mode=0o700)
+    lock = native.NativeProfileLock(str(root)).acquire()
+    lock_device, lock_inode = lock.identity
+    generation = "generation-late-proof-failure"
+    runtime = native._NativeRuntime(
+        process=SimpleNamespace(pid=4242),
+        process_start_time=100.0,
+        cdp_url="http://127.0.0.1:43123",
+        cdp_port=43123,
+        snapshot_uuid="snapshot-1",
+        executable_fingerprint="f" * 64,
+        lock=lock,
+        hermes_home=canonical_home,
+        snapshot_path=str(snapshot),
+        supervisor_path=str(root),
+        source_profile_hash="source-hash",
+        expected_account_hash="account-hash",
+        lease_path=str(root / "runtime.json"),
+        runtime_generation=generation,
+        lock_device=lock_device,
+        lock_inode=lock_inode,
+    )
+    native._write_runtime_lease(runtime)
+    lock.release()
+    monkeypatch.setattr(native, "_validate_stable_chrome", lambda: "f" * 64)
+    monkeypatch.setattr(native, "_runtime_is_valid", lambda *_args: True)
+    monkeypatch.setattr(native, "_refresh_provisional_runtime", lambda *_args: False)
+    monkeypatch.setattr(
+        native,
+        "_prove_recorded_runtime",
+        Mock(
+            side_effect=native.NativeProfileError(
+                "native_cleanup_identity_ambiguous", "late proof failed"
+            )
+        ),
+    )
+    scheduled = Mock()
+    monkeypatch.setattr(native, "_schedule_native_profile_cleanup", scheduled)
+    supervisor = native.NativeProfileSupervisor.for_profile(home)
+
+    try:
+        with pytest.raises(native.NativeProfileError) as raised:
+            supervisor.acquire(_NATIVE_CONFIG, {})
+
+        assert raised.value.code == "native_cleanup_identity_ambiguous"
+        assert canonical_home not in native._client_leases
+        assert native._runtimes[canonical_home].runtime_generation == generation
+        assert (root / "runtime.json").exists()
+        scheduled.assert_called_once_with(
+            120.0,
+            hermes_home=canonical_home,
+            runtime_generation=generation,
+        )
+    finally:
+        native._client_leases.pop(canonical_home, None)
+        adopted = native._runtimes.pop(canonical_home, None)
+        if adopted is not None:
+            adopted.lock.release()
+
+
 def test_native_browser_exec_never_consults_or_publishes_builtin_session_cache(
     monkeypatch,
 ):
@@ -863,6 +939,134 @@ def test_revocation_cannot_reenter_native_daemon_namespace(
     supervisor.cleanup.assert_called_once_with(delete_snapshot=True)
     supervisor.acquire.assert_not_called()
     launch.assert_not_called()
+
+
+def test_native_toggle_revocation_cleans_state_before_generic_route(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.native_real_profile as native
+    import tools.browser_use_cli as browser_use
+
+    home = tmp_path / "profile"
+    state_root = home / "browser-supervisor" / "native-real-profile"
+    (state_root / "snapshot").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    revoked = {
+        **_NATIVE_CONFIG,
+        "use_real_profile": True,
+        "real_profile_macos_native": False,
+    }
+    supervisor = Mock()
+    monkeypatch.setattr(
+        native.NativeProfileSupervisor,
+        "for_profile",
+        classmethod(lambda cls, profile=None: supervisor),
+    )
+    monkeypatch.setattr(browser_use, "_read_browser_cfg", lambda **_kw: revoked)
+    monkeypatch.setattr(browser_use, "_blocked_url_in_code", lambda _code: None)
+    generic_route = Mock(
+        side_effect=AssertionError("native revocation must refuse the generic route")
+    )
+    monkeypatch.setattr(browser_use, "_base_subprocess_env", generic_route)
+
+    payload = _tool_payload(browser_use.browser_exec("print('must not run')"))
+
+    assert "new session" in payload["error"].lower()
+    supervisor.cleanup.assert_called_once_with(delete_snapshot=True)
+    supervisor.acquire.assert_not_called()
+    generic_route.assert_not_called()
+
+
+def test_native_false_cli_unavailable_precedes_legacy_real_profile_resolution(
+    monkeypatch, tmp_path
+):
+    import tools.browser_use_cli as browser_use
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config = {
+        **_NATIVE_CONFIG,
+        "use_real_profile": True,
+        "real_profile_macos_native": False,
+    }
+    monkeypatch.setattr(browser_use, "_read_browser_cfg", lambda **_kw: config)
+    monkeypatch.setattr(browser_use, "_blocked_url_in_code", lambda _code: None)
+    monkeypatch.setattr(browser_use, "_find_cli", lambda: None)
+    legacy_resolution = Mock(
+        side_effect=AssertionError("CLI availability must precede browser resolution")
+    )
+    monkeypatch.setattr(browser_use, "_resolve_real_profile_cdp", legacy_resolution)
+
+    payload = _tool_payload(browser_use.browser_exec("print('must not run')"))
+
+    assert "CLI not found" in payload["error"]
+    legacy_resolution.assert_not_called()
+
+
+@pytest.mark.parametrize("contents", ["browser: [", "not-a-mapping\n"])
+def test_native_false_without_state_preserves_tolerant_generic_config_read(
+    monkeypatch, tmp_path, contents
+):
+    import hermes_cli.config as config
+    import tools.browser_use_cli as browser_use
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    config_path.write_text(contents, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(config, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(browser_use, "_blocked_url_in_code", lambda _code: None)
+    monkeypatch.setattr(browser_use, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(browser_use, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(browser_use, "_resolve_real_profile_cdp", lambda *_args, **_kw: None)
+    monkeypatch.setattr(browser_use, "_resolve_backend_cdp", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        browser_use.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="generic", stderr=""
+        ),
+    )
+
+    payload = _tool_payload(browser_use.browser_exec("print('generic')"))
+
+    assert payload["success"] is True
+    assert payload["output"] == "generic"
+
+
+def test_corrupt_config_with_native_state_fails_before_cleanup_or_generic_route(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.config as config
+    import hermes_cli.native_real_profile as native
+    import tools.browser_use_cli as browser_use
+
+    home = tmp_path / "profile"
+    state_root = home / "browser-supervisor" / "native-real-profile"
+    (state_root / "snapshot").mkdir(parents=True)
+    config_path = home / "config.yaml"
+    config_path.write_text("browser: [", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(config, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(browser_use, "_blocked_url_in_code", lambda _code: None)
+    supervisor = Mock()
+    monkeypatch.setattr(
+        native.NativeProfileSupervisor,
+        "for_profile",
+        classmethod(lambda cls, profile=None: supervisor),
+    )
+    generic_route = Mock(
+        side_effect=AssertionError("corrupt native state must fail before generic routing")
+    )
+    monkeypatch.setattr(browser_use, "_find_cli", generic_route)
+
+    payload = _tool_payload(browser_use.browser_exec("print('must not run')"))
+
+    assert "configuration is unavailable" in payload["error"].lower()
+    supervisor.cleanup.assert_not_called()
+    generic_route.assert_not_called()
 
 
 def test_user_session_cannot_claim_reserved_native_namespace(monkeypatch):
@@ -2154,7 +2358,9 @@ def test_failed_acquire_removes_exact_token_and_restores_cleanup(monkeypatch, tm
         supervisor.acquire(dict(_NATIVE_CONFIG), {})
 
     assert home not in native._client_leases
-    scheduled.assert_called_once_with(120.0, hermes_home=home)
+    scheduled.assert_called_once_with(
+        120.0, hermes_home=home, runtime_generation="generation-b"
+    )
     native._runtimes.pop(home, None)
 
 
@@ -2182,7 +2388,9 @@ def test_release_arms_cleanup_for_the_exact_runtime_generation(monkeypatch, tmp_
     )
 
 
-@pytest.mark.parametrize("contents", ["browser: [", "not-a-mapping\n"])
+@pytest.mark.parametrize(
+    "contents", ["browser: [", "not-a-mapping\n", "browser: true\n"]
+)
 def test_browser_exec_config_read_fails_closed_on_invalid_yaml_root(
     monkeypatch, tmp_path, contents
 ):
@@ -2231,6 +2439,48 @@ def test_missing_root_retains_runtime_until_recorded_listener_absence_is_proven(
     assert raised.value.code == "native_cleanup_uncertain"
 
 
+def test_cleanup_keeps_runtime_lease_when_missing_root_listener_is_ambiguous(
+    monkeypatch, tmp_path
+):
+    import psutil
+
+    import hermes_cli.native_real_profile as native
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    canonical_home, snapshot, _root = native._profile_scope(home)
+    runtime = cast(
+        native._NativeRuntime,
+        SimpleNamespace(
+            process=SimpleNamespace(pid=999999),
+            snapshot_path=str(snapshot),
+            cdp_port=43123,
+            runtime_generation="generation-listener-ambiguous",
+            lock=Mock(),
+        ),
+    )
+    native._runtimes[canonical_home] = runtime
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(999999)),
+    )
+    monkeypatch.setattr(native, "_processes_owning_data_dir", lambda *_args: [])
+    monkeypatch.setattr(native, "_query_lsof_listener_owners", lambda _port: None)
+    remove_runtime_lease = Mock()
+    monkeypatch.setattr(native, "_remove_runtime_lease", remove_runtime_lease)
+
+    try:
+        with pytest.raises(native.NativeProfileError) as raised:
+            native._cleanup_native_profile(hermes_home=home)
+
+        assert raised.value.code == "native_cleanup_uncertain"
+        assert native._runtimes[canonical_home] is runtime
+        remove_runtime_lease.assert_not_called()
+    finally:
+        native._runtimes.pop(canonical_home, None)
+
+
 @pytest.mark.parametrize("value", [float("inf"), float("nan"), 0, -1])
 def test_native_startup_timeout_rejects_nonfinite_or_nonpositive_values(value):
     import hermes_cli.native_real_profile as native
@@ -2245,3 +2495,49 @@ def test_native_startup_timeout_has_a_finite_upper_bound():
     import hermes_cli.native_real_profile as native
 
     assert native._native_startup_timeout(10**100) == 120.0
+
+
+def test_disabling_native_toggle_cleans_existing_snapshot_before_other_routes(
+    monkeypatch, tmp_path
+):
+    import hermes_constants
+    import hermes_cli.native_real_profile as native
+    import tools.browser_use_cli as browser_use
+
+    state_root = tmp_path / "browser-supervisor" / "native-real-profile"
+    (state_root / "snapshot").mkdir(parents=True)
+    supervisor = Mock()
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        native.NativeProfileSupervisor,
+        "for_profile",
+        classmethod(lambda cls, home=None: supervisor),
+    )
+
+    error = browser_use._cleanup_revoked_native_profile(
+        dict(_NATIVE_CONFIG, real_profile_macos_native=False)
+    )
+
+    assert error is not None
+    assert "Native real-profile mode is off" in error
+    supervisor.cleanup.assert_called_once_with(delete_snapshot=True)
+
+
+def test_missing_browser_use_cli_prevents_legacy_real_profile_side_effects(monkeypatch):
+    import tools.browser_use_cli as browser_use
+
+    config = dict(
+        _NATIVE_CONFIG,
+        real_profile_macos_native=False,
+        use_real_profile=True,
+    )
+    resolve = Mock(side_effect=AssertionError("resolver must not run without CLI"))
+    monkeypatch.setattr(browser_use, "_read_browser_cfg", lambda **_kw: config)
+    monkeypatch.setattr(browser_use, "_find_cli", lambda: None)
+    monkeypatch.setattr(browser_use, "_resolve_real_profile_cdp", resolve)
+    monkeypatch.setattr(browser_use, "_blocked_url_in_code", lambda _code: None)
+
+    payload = _tool_payload(browser_use.browser_exec("print('x')"))
+
+    assert "browser-use CLI not found" in payload["error"]
+    resolve.assert_not_called()

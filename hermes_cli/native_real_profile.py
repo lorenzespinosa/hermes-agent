@@ -2503,8 +2503,13 @@ class NativeProfileSupervisor:
                     tokens.discard(token)
                     if not tokens:
                         _client_leases.pop(home, None)
-                if not _client_leases.get(home) and _runtimes.get(home) is not None:
-                    _schedule_native_profile_cleanup(delay, hermes_home=home)
+                runtime = _runtimes.get(home)
+                if not _client_leases.get(home) and runtime is not None:
+                    _schedule_native_profile_cleanup(
+                        delay,
+                        hermes_home=home,
+                        runtime_generation=runtime.runtime_generation,
+                    )
                 raise
 
     def release(self, client: NativeProfileClient) -> None:
@@ -3068,9 +3073,9 @@ def _resolve_native_profile_cdp(
                     )
                 )
                 if valid:
-                    _prove_recorded_runtime(persisted)
                     _runtimes[home] = persisted
                     lock_retained = True
+                    _prove_recorded_runtime(persisted)
                     return persisted.cdp_url
 
                 # A live persisted owner is never ignored. If its immutable
