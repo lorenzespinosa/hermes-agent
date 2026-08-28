@@ -253,7 +253,13 @@ def test_native_browser_exec_uses_only_supervisor_endpoint_and_sanitized_env(
     env = captured["env"]
     assert env["BU_CDP_URL"] == client.cdp_url
     assert env["BU_NAME"].startswith("hermes_native_")
-    assert "generation-7" in env["BU_NAME"]
+    assert len(env["BU_NAME"]) <= 30
+    assert env["BU_NAME"] == browser_use._native_daemon_session_name(
+        "work", client.hermes_home, client.runtime_namespace
+    )
+    assert env["BU_NAME"] != browser_use._native_daemon_session_name(
+        "work", client.hermes_home, "generation-8"
+    )
     for key in (
         "BU_CDP_WS",
         "BROWSER_CDP_URL",
@@ -388,7 +394,8 @@ def test_concurrent_native_browser_exec_calls_hold_independent_clients(
     assert all(result["success"] is True for result in results)
     assert len(captured_envs) == 2
     assert len({env["BU_NAME"] for env in captured_envs}) == 2
-    assert all("generation-shared" in env["BU_NAME"] for env in captured_envs)
+    assert all(env["BU_NAME"].startswith("hermes_native_") for env in captured_envs)
+    assert all(len(env["BU_NAME"]) <= 30 for env in captured_envs)
     assert {call.args[0].token for call in supervisor.release.call_args_list} == {
         "client-0",
         "client-1",
@@ -446,8 +453,8 @@ def test_new_runtime_generation_gets_new_native_daemon_namespace(monkeypatch, tm
     assert second["success"] is True
     assert len(names) == 2
     assert names[0] != names[1]
-    assert "generation-before-restar" in names[0]
-    assert "generation-after-restart" in names[1]
+    assert all(name.startswith("hermes_native_") for name in names)
+    assert all(len(name) <= 30 for name in names)
 
 
 def test_launch_persists_launching_then_ready_with_one_generation(monkeypatch, tmp_path):

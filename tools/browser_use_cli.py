@@ -37,11 +37,16 @@ _NATIVE_SESSION_PREFIX = "hermes_native_"
 def _native_daemon_session_name(
     requested: str, hermes_home: str, runtime_generation: str
 ) -> str:
-    """Bind the Browser Use daemon to one native Chrome generation."""
-    generation = re.sub(r"[^A-Za-z0-9_-]", "_", runtime_generation)[:24]
-    material = f"{hermes_home}\0{requested or 'default'}".encode("utf-8")
-    suffix = hashlib.sha256(material).hexdigest()[:12]
-    return f"{_NATIVE_SESSION_PREFIX}{generation}_{suffix}"
+    """Bind the Browser Use daemon to one native Chrome generation.
+
+    Keep the internal daemon name short enough for macOS AF_UNIX socket paths.
+    The digest still binds the full generation, home, and requested session.
+    """
+    material = (
+        f"{hermes_home}\0{requested or 'default'}\0{runtime_generation}".encode("utf-8")
+    )
+    suffix = hashlib.sha256(material).hexdigest()[:16]
+    return f"{_NATIVE_SESSION_PREFIX}{suffix}"
 
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
