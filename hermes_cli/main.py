@@ -163,6 +163,11 @@ def _cleanup_oneshot_runtime() -> None:
     except Exception:
         pass
     try:
+        from hermes_cli.native_real_profile import NativeProfileSupervisor
+        NativeProfileSupervisor.cleanup_all()
+    except Exception:
+        pass
+    try:
         from tools.mcp_tool import shutdown_mcp_servers
         shutdown_mcp_servers()
     except BaseException:
@@ -13299,8 +13304,24 @@ def main():
         "--browser",
         help="Override detected default browser (chrome/edge/brave/chromium)",
     )
+    browser_subparsers.add_parser(
+        "cleanup-native-profile",
+        help="After Hermes is stopped, verify no native owner remains and remove only the native snapshot",
+    )
 
     def _dispatch_browser(_args):
+        action = getattr(_args, "browser_action", None)
+        if action == "cleanup-native-profile":
+            try:
+                from hermes_cli.native_real_profile import NativeProfileSupervisor
+
+                NativeProfileSupervisor.for_profile().cleanup(delete_snapshot=True)
+            except Exception as exc:
+                code = getattr(exc, "code", "native_cleanup_failed")
+                print(f"✗ Native cleanup failed [{code}]: {exc}", file=sys.stderr)
+                return 1
+            print("✓ Native browser is absent and its Hermes snapshot was removed.")
+            return 0
         from hermes_cli.browser_connect import (
             UNSUPPORTED_CHANNEL,
             close_browser_holding_profile,
@@ -13308,7 +13329,6 @@ def main():
             real_profile_data_dir,
         )
 
-        action = getattr(_args, "browser_action", None)
         if action != "close-profile":
             browser_parser.print_help()
             return 2
