@@ -287,13 +287,15 @@ def test_native_browser_exec_uses_only_supervisor_endpoint_and_sanitized_env(
 def test_native_daemon_name_fits_default_macos_unix_socket_path():
     import tools.browser_use_cli as browser_use
 
+    child_home = Path("/Users/lorenzleslie-extra")
     name = browser_use._native_daemon_session_name(
         "acceptance",
         "/Users/lorenzleslie/.hermes",
         "generation-1234567890abcdef",
+        str(child_home),
     )
     socket_path = (
-        Path.home()
+        child_home
         / ".config"
         / "browser-harness"
         / "runtime"
@@ -327,7 +329,7 @@ def test_native_browser_exec_releases_client_on_subprocess_timeout(monkeypatch):
     monkeypatch.setattr(
         local_env,
         "hermes_subprocess_env",
-        lambda **_kwargs: {"PATH": "/usr/bin"},
+        lambda **_kwargs: {"PATH": "/usr/bin", "HOME": "/tmp"},
     )
     monkeypatch.setattr(
         browser_use.subprocess,
@@ -376,7 +378,7 @@ def test_concurrent_native_browser_exec_calls_hold_independent_clients(
     monkeypatch.setattr(
         local_env,
         "hermes_subprocess_env",
-        lambda **_kwargs: {"PATH": "/usr/bin", "HOME": str(tmp_path)},
+        lambda **_kwargs: {"PATH": "/usr/bin", "HOME": "/tmp"},
     )
     entered = threading.Barrier(2)
     checked = threading.Barrier(2)
@@ -447,7 +449,7 @@ def test_new_runtime_generation_gets_new_native_daemon_namespace(monkeypatch, tm
     monkeypatch.setattr(
         local_env,
         "hermes_subprocess_env",
-        lambda **_kwargs: {"PATH": "/usr/bin", "HOME": str(tmp_path)},
+        lambda **_kwargs: {"PATH": "/usr/bin", "HOME": "/tmp"},
     )
     names = []
     monkeypatch.setattr(
@@ -467,10 +469,10 @@ def test_new_runtime_generation_gets_new_native_daemon_namespace(monkeypatch, tm
     assert len(names) == 2
     assert names[0] != names[1]
     assert names[0] == browser_use._native_daemon_session_name(
-        "work", str(tmp_path), "generation-before-restart"
+        "work", str(tmp_path), "generation-before-restart", "/tmp"
     )
     assert names[1] == browser_use._native_daemon_session_name(
-        "work", str(tmp_path), "generation-after-restart"
+        "work", str(tmp_path), "generation-after-restart", "/tmp"
     )
 
 
