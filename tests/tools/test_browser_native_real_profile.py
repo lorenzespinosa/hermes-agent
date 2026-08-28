@@ -833,8 +833,15 @@ def test_failed_final_durable_adoption_restores_generation_cleanup(
             adopted.lock.release()
 
 
-def test_stale_durable_adoption_retains_lease_when_listener_absence_is_ambiguous(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("listener_absent", "snapshot_owners", "expected_code"),
+    [
+        (False, [], "native_cached_proof_failed"),
+        (True, [8888], "native_snapshot_owned"),
+    ],
+)
+def test_stale_durable_adoption_retains_lease_until_all_absence_is_proven(
+    monkeypatch, tmp_path, listener_absent, snapshot_owners, expected_code
 ):
     import hermes_cli.native_real_profile as native
 
@@ -875,9 +882,13 @@ def test_stale_durable_adoption_retains_lease_when_listener_absence_is_ambiguous
         Mock(side_effect=native.NativeProfileError("native_cached_proof_failed", "stale")),
     )
     monkeypatch.setattr(native, "_recorded_process_is_absent", lambda _runtime: True)
-    monkeypatch.setattr(native, "_recorded_listener_is_absent", lambda _port: False)
     monkeypatch.setattr(
-        native, "_processes_owning_data_dir", lambda *_args, **_kwargs: []
+        native, "_recorded_listener_is_absent", lambda _port: listener_absent
+    )
+    monkeypatch.setattr(
+        native,
+        "_processes_owning_data_dir",
+        lambda path, **_kwargs: snapshot_owners if path == str(snapshot) else [],
     )
     provision = Mock(side_effect=AssertionError("ambiguous listener must block provisioning"))
     monkeypatch.setattr(native, "provision_native_snapshot", provision)
@@ -887,7 +898,7 @@ def test_stale_durable_adoption_retains_lease_when_listener_absence_is_ambiguous
     with pytest.raises(native.NativeProfileError) as raised:
         native.NativeProfileSupervisor.for_profile(home).acquire(_NATIVE_CONFIG, {})
 
-    assert raised.value.code == "native_cached_proof_failed"
+    assert raised.value.code == expected_code
     assert (root / "runtime.json").exists()
     provision.assert_not_called()
     launch.assert_not_called()
