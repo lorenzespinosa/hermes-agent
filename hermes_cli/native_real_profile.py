@@ -3094,7 +3094,7 @@ def _resolve_native_profile_cdp(
                             "native_cached_proof_failed",
                             "A persisted native browser listener could not be proven absent.",
                         ) from proof_error
-                    if snapshot.exists() and _processes_owning_data_dir(str(snapshot)):
+                    if _processes_owning_data_dir(str(snapshot)):
                         raise NativeProfileError(
                             "native_snapshot_owned",
                             "The native snapshot has an unproven incumbent owner.",
