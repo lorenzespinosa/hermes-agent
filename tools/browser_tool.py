@@ -1447,10 +1447,9 @@ def _use_real_profile() -> bool:
     return False
 
 
-# Session name for the single shared real-profile copy-browser. All consented
-# local browsing attaches to this one agent-browser session so concurrent
-# tasks reuse the same copy-browser instead of each launching a rival Chromium
-# on the same copied user-data-dir.
+# Session name for the shared agent-browser copy-browser used off macOS (and by
+# older macOS builds). Darwin's direct signed-browser path shares the same
+# snapshot and CDP cache without registering a parallel agent-browser session.
 _REAL_PROFILE_SESSION = "hermes-real-profile"
 _real_profile_cdp_lock = threading.Lock()
 _real_profile_cdp_cache: dict = {}
@@ -1539,17 +1538,16 @@ def _real_profile_cdp() -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
     Snapshots the user's default-Chromium profile into a hermes-owned copy
-    (auth/login state only), then has agent-browser launch its packaged
-    Chromium on that copy and returns the HTTP CDP endpoint for the browser-use
-    harness to attach to. The copy is a non-default dir, so it sidesteps the
-    Chrome ≥136 default-profile remote-debugging block and never contends with
-    the user's running browser; agent-browser launches the packaged Chromium
-    with no mock-keychain switches, so keyring-encrypted cookies decrypt.
+    (auth/login state only), then returns an HTTP CDP endpoint for the active
+    browser lane to attach to. On macOS the installed signed browser is launched
+    directly on the copy because Chrome for Testing cannot access stable
+    Chrome's Safe Storage Keychain item. Other platforms keep the existing
+    agent-browser packaged-Chromium launch path.
 
-    A single shared agent-browser session is reused across calls (its CDP URL
-    is cached and re-validated). Returns ``(None, message)`` fail-closed when
-    the default browser is non-Chromium or the snapshot/launch fails;
-    ``(None, None)`` when consent is off.
+    A single shared copy-browser is reused across calls (its CDP URL is cached
+    and re-validated). Returns ``(None, message)`` fail-closed when the default
+    browser is non-Chromium or the snapshot/launch fails; ``(None, None)`` when
+    consent is off.
     """
     if not _use_real_profile():
         # Consent is off. If a snapshot store from a previous consented run is
@@ -1581,7 +1579,9 @@ def _real_profile_cdp() -> tuple:
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
         detect_default_chromium,
+        launch_darwin_real_profile_browser,
         real_profile_copy_dir,
+        reusable_darwin_real_profile_cdp,
         snapshot_real_profile,
     )
 
@@ -1623,14 +1623,29 @@ def _real_profile_cdp() -> tuple:
         # snapshot/overlay happens solely on the relaunch path below, when no
         # live browser owns the dir.
         copy_dir = real_profile_copy_dir(browser)
-        existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
-        if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
-            _real_profile_cdp_cache["cdp"] = existing
-            return existing, None
-        if existing:
-            # Stale/wrong-dir session (throwaway-temp fallback, or an old copy):
-            # close it so nothing holds the dir open before we overlay + relaunch.
-            _agent_browser_close_session(_REAL_PROFILE_SESSION)
+        if sys.platform == "darwin":
+            # Older builds used agent-browser's Chrome for Testing on this
+            # snapshot. Close that named session first: its signed bundle cannot
+            # decrypt stable Chrome's Safe Storage cookies even when the mock /
+            # basic flags are absent.
+            legacy = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
+            if legacy:
+                _agent_browser_close_session(_REAL_PROFILE_SESSION)
+            existing, reuse_err = reusable_darwin_real_profile_cdp(browser, copy_dir)
+            if reuse_err:
+                return None, f"browser.use_real_profile is on, but {reuse_err}"
+            if existing:
+                _real_profile_cdp_cache["cdp"] = existing
+                return existing, None
+        else:
+            existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
+            if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
+                _real_profile_cdp_cache["cdp"] = existing
+                return existing, None
+            if existing:
+                # Stale/wrong-dir session (throwaway-temp fallback, or an old copy):
+                # close it so nothing holds the dir open before we overlay + relaunch.
+                _agent_browser_close_session(_REAL_PROFILE_SESSION)
 
         # No live browser owns the dir now — safe to (re)snapshot + overlay.
         snap_dir, err = snapshot_real_profile(browser)
@@ -1650,6 +1665,21 @@ def _real_profile_cdp() -> tuple:
                 )
             return None, f"browser.use_real_profile is on, but {err}"
         copy_dir = snap_dir
+
+        if sys.platform == "darwin":
+            cdp, launch_err = launch_darwin_real_profile_browser(
+                browser,
+                copy_dir,
+                timeout=_get_open_command_timeout(first_open=True),
+            )
+            if launch_err or not cdp:
+                return None, (
+                    "browser.use_real_profile is on, but "
+                    + (launch_err or "the installed browser launch failed.")
+                )
+            _real_profile_cdp_cache["cdp"] = cdp
+            logger.info("real-profile browser ready for %s on managed snapshot", browser)
+            return cdp, None
 
         # Launch agent-browser's packaged Chromium on the profile COPY. This is
         # the same launch path Hermes' built-in local browsing already uses,

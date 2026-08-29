@@ -447,12 +447,12 @@ def detect_default_chromium(system: str | None = None) -> str | None:
 # live dir is usually held by the user's running browser (SingletonLock).
 # Instead we snapshot the real profile into ``~/.hermes/browser-profile/``
 # — a non-default dir Chrome will happily debug, that never contends with
-# the user's browser — launch the user's real binary on the copy with a
-# devtools port, and hand the CDP URL to whichever browser lane is active
-# (Browser Use CLI or the built-in tools). We launch the browser ourselves
-# precisely so NO mock-keychain/basic-store switches are added: cookies
-# encrypted with the OS keyring (gnome-keyring / kwallet / macOS Keychain)
-# decrypt exactly like they do in the user's own browser.
+# the user's browser — and hand its CDP URL to whichever browser lane is
+# active (Browser Use CLI or the built-in tools). On Darwin, the installed
+# signed browser is launched directly on the copy with no mock-keychain or
+# basic-store switches; Chrome for Testing cannot access stable Chrome's Safe
+# Storage Keychain item. Other platforms retain agent-browser's packaged
+# Chromium launch path.
 # ---------------------------------------------------------------------------
 
 # Directory names excluded from the profile snapshot: caches/telemetry AND the
@@ -921,11 +921,18 @@ def cleanup_real_profile_snapshots() -> None:
     """Delete the whole real-profile snapshot store (all copied credentials).
 
     Called when consent is OFF: the copied Cookies / Login Data must not
-    outlive the toggle. Best-effort and idempotent — missing dir is fine.
+    outlive the toggle. On macOS, stop any signed browser that Hermes launched
+    on a managed snapshot before unlinking its credential databases. Best-effort
+    and idempotent — missing dir is fine.
     """
     root = str(get_hermes_home() / "browser-profile")
     try:
         if os.path.isdir(root):
+            if platform.system() == "Darwin":
+                for browser in _CHROMIUM_BROWSERS:
+                    snapshot = os.path.join(root, browser)
+                    if os.path.isdir(snapshot):
+                        close_browser_holding_profile(snapshot)
             shutil.rmtree(root, ignore_errors=True)
             logger.info("real-profile: removed snapshot store %s (consent off)", root)
     except OSError as e:
@@ -1128,6 +1135,191 @@ def _detach_kwargs(system: str) -> dict:
         subprocess, "CREATE_NEW_PROCESS_GROUP", 0
     )
     return {"creationflags": flags} if flags else {}
+
+
+def _snapshot_cdp_url(snapshot_dir: str, timeout: float = 1.0) -> str | None:
+    """Return the loopback CDP root recorded by ``snapshot_dir``, if live."""
+    try:
+        with open(
+            os.path.join(snapshot_dir, "DevToolsActivePort"),
+            encoding="utf-8",
+            errors="replace",
+        ) as fh:
+            lines = [line.strip() for line in fh.readlines()[:2]]
+        if len(lines) != 2 or not lines[0].isdecimal():
+            return None
+        port = int(lines[0])
+        if not 1 <= port <= 65535 or not re.fullmatch(
+            r"/devtools/browser/[A-Za-z0-9._-]+", lines[1]
+        ):
+            return None
+    except OSError:
+        return None
+    url = f"http://127.0.0.1:{port}"
+    return url if is_browser_debug_ready(url, timeout=timeout) else None
+
+
+def _validated_darwin_snapshot(browser: str, snapshot_dir: str) -> tuple[str | None, str | None]:
+    """Prove a launch target is this browser's completed Hermes snapshot."""
+    try:
+        expected = os.path.realpath(real_profile_copy_dir(browser))
+        actual = os.path.realpath(os.path.abspath(snapshot_dir))
+        live = real_profile_data_dir(browser, "Darwin")
+        live = os.path.realpath(live) if live else None
+    except (OSError, TypeError, ValueError):
+        return None, "the managed profile snapshot path could not be validated."
+    if actual != expected or actual == live:
+        return None, (
+            "the requested browser directory is not the isolated Hermes profile snapshot; "
+            "refusing to launch it."
+        )
+    if not os.path.isdir(actual) or not os.path.isfile(
+        os.path.join(actual, _SNAPSHOT_DONE_MARKER)
+    ):
+        return None, "the managed profile snapshot is absent or incomplete."
+    return actual, None
+
+
+def reusable_darwin_real_profile_cdp(
+    browser: str, snapshot_dir: str
+) -> tuple[str | None, str | None]:
+    """Return a reusable signed-browser CDP endpoint, failing closed on ambiguity.
+
+    ``DevToolsActivePort`` alone is not an identity proof: an older Hermes
+    build may have launched Chrome for Testing on this same copy. Require the
+    exact ``--user-data-dir`` root process to resolve to the installed stable
+    browser before reusing its endpoint; helper processes may mention the copy
+    in crash/log paths and do not own it.
+    """
+    cdp = _snapshot_cdp_url(snapshot_dir)
+    owners = list(_processes_holding_profile(snapshot_dir))
+    roots = []
+    target = os.path.realpath(snapshot_dir)
+    for proc in owners:
+        try:
+            cmdline = proc.info.get("cmdline") or proc.cmdline()
+            for index, arg in enumerate(cmdline):
+                value = None
+                if arg.startswith("--user-data-dir="):
+                    value = arg.split("=", 1)[1]
+                elif arg == "--user-data-dir" and index + 1 < len(cmdline):
+                    value = cmdline[index + 1]
+                if value and os.path.realpath(os.path.abspath(value)) == target:
+                    roots.append(proc)
+                    break
+        except Exception:
+            continue
+    if not roots:
+        if cdp:
+            return None, (
+                "the managed profile exposes a devtools endpoint, but its browser "
+                "process identity could not be verified."
+            )
+        return None, None
+    if len(roots) != 1:
+        return None, (
+            "multiple browser processes claim ownership of the managed profile; "
+            "refusing to choose one."
+        )
+
+    executable = chromium_executable(browser, "Darwin")
+    if not executable:
+        return None, f"the installed signed {browser} browser could not be found."
+    expected = os.path.realpath(executable)
+    try:
+        executables = {os.path.realpath(proc.exe()) for proc in roots}
+    except Exception:
+        return None, (
+            "a browser is using the managed profile, but its executable identity "
+            "could not be verified."
+        )
+    if executables != {expected}:
+        return None, (
+            "a browser is using the managed profile, but it is not unambiguously "
+            "the installed signed browser."
+        )
+    if not cdp:
+        return None, (
+            "the installed browser is using the managed profile without a reachable "
+            "loopback devtools endpoint."
+        )
+    return cdp, None
+
+
+def launch_darwin_real_profile_browser(
+    browser: str, snapshot_dir: str, timeout: float = 30.0
+) -> tuple[str | None, str | None]:
+    """Launch the installed signed browser on a Hermes snapshot and return CDP.
+
+    Stable Chrome's macOS Keychain identity is required to read cookies copied
+    from stable Chrome. Chrome for Testing has a different signed identity, so
+    omitting ``--use-mock-keychain`` is not sufficient. The browser is launched
+    directly only on Darwin; Browser Use and agent-browser still attach through
+    the returned loopback endpoint.
+    """
+    snapshot, err = _validated_darwin_snapshot(browser, snapshot_dir)
+    if err or not snapshot:
+        return None, err
+    executable = chromium_executable(browser, "Darwin")
+    if not executable:
+        return None, f"the installed signed {browser} browser could not be found."
+
+    active_port = os.path.join(snapshot, "DevToolsActivePort")
+    try:
+        os.unlink(active_port)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return None, f"the managed profile's stale devtools marker could not be removed: {exc}"
+
+    argv = [
+        executable,
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=0",
+        f"--user-data-dir={snapshot}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--headless=new",
+        "about:blank",
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **_detach_kwargs("Darwin"),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"the installed signed {browser} browser could not be launched: {exc}"
+
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while time.monotonic() < deadline:
+        cdp = _snapshot_cdp_url(snapshot, timeout=0.2)
+        if cdp:
+            return cdp, None
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    try:
+        from agent.deadline import kill_process_tree
+
+        kill_process_tree(proc.pid)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if proc.poll() is not None:
+        return None, (
+            f"the installed signed {browser} browser exited before exposing a "
+            "loopback devtools endpoint."
+        )
+    return None, (
+        f"the installed signed {browser} browser did not expose a loopback "
+        "devtools endpoint before the launch timeout."
+    )
 
 
 def _wait_for_browser_debug_ready_or_exit(

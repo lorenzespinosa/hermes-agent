@@ -173,14 +173,21 @@ browser:
 When enabled, Hermes copies your default browser's **active** profile — the one
 you actually browse (`Local State → profile.last_used`), with its cookies, saved
 logins, and preferences — into a managed snapshot under
-`~/.hermes/browser-profile/<browser>/`, then drives that snapshot with its
-packaged Chromium. Your live browser profile is **never opened directly**: the
-snapshot is a separate directory, so it doesn't fight your running browser for
-the profile lock and it sidesteps Chrome 136+'s block on remote-debugging the
-default profile directory. The auth files (cookies/logins/preferences) are
-re-synced from your real profile whenever a fresh session is launched, so logins
-you do in your own browser show up in the agent's session. Only the active
-profile is copied — other Chrome profiles are never snapshotted.
+`~/.hermes/browser-profile/<browser>/`, then drives only that snapshot. Your
+live browser profile is **never opened directly**: the snapshot is a separate
+directory, so it doesn't fight your running browser for the profile lock and it
+sidesteps Chrome 136+'s block on remote-debugging the default profile directory.
+The auth files (cookies/logins/preferences) are re-synced from your real profile
+whenever a fresh session is launched, so logins you do in your own browser show
+up in the agent's session. Only the active profile is copied — other Chrome
+profiles are never snapshotted.
+
+On macOS, Hermes launches the installed signed version of your stable default
+Chromium browser on the snapshot and connects `browser_exec` through loopback
+CDP. This is required for profiles copied from stable Chrome because Chrome for
+Testing has a different signed bundle identity and cannot access the existing
+Chrome Safe Storage Keychain item. Hermes never changes Keychain ACLs. Linux and
+Windows keep the packaged-browser launch path.
 
 When you turn the toggle back off, Hermes deletes the snapshot store
 (`~/.hermes/browser-profile/`) on the next browser use, so the copied
