@@ -972,12 +972,6 @@ def _cleanup_all_browsers(*args, **kwargs):
 
     return _emergency_cleanup_all_sessions(*args, **kwargs)
 
-
-def _cleanup_all_native_profiles():
-    from hermes_cli.native_real_profile import NativeProfileSupervisor
-
-    return NativeProfileSupervisor.cleanup_all()
-
 # Guard to prevent cleanup from running multiple times on exit
 _cleanup_done = False
 _cleanup_in_progress = False
@@ -1215,10 +1209,6 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
             pass
         try:
             _cleanup_all_browsers()
-        except Exception:
-            pass
-        try:
-            _cleanup_all_native_profiles()
         except Exception:
             pass
         try:

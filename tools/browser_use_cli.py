@@ -4,7 +4,6 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -13,7 +12,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils import is_truthy_value
 
@@ -30,47 +29,6 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # browser, or a named Browser Use cloud browser). Popped before the
 # subprocess launches — never exported to the CLI.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
-_NATIVE_BROWSER_SENTINEL = "_HERMES_BU_NATIVE_BROWSER"
-_NATIVE_SESSION_PREFIX = "hermes_native_"
-
-
-def _native_daemon_session_name(
-    requested: str,
-    hermes_home: str,
-    runtime_generation: str,
-    subprocess_home: str,
-) -> str:
-    """Bind the Browser Use daemon to one native Chrome generation."""
-    material = (
-        f"{hermes_home}\0{requested or 'default'}\0{runtime_generation}"
-    ).encode("utf-8")
-    suffix = hashlib.sha256(material).hexdigest()[:12]
-    # browser-harness stores ``bu-<BU_NAME>.sock`` below its default runtime
-    # directory. macOS AF_UNIX paths are limited to 104 bytes including the
-    # terminator, so budget the generation fragment against the actual home.
-    child_home = Path(subprocess_home)
-    if not subprocess_home or not child_home.is_absolute():
-        raise ValueError("Browser Use requires an absolute subprocess HOME.")
-    socket_base = (
-        child_home
-        / ".config"
-        / "browser-harness"
-        / "runtime"
-        / "bu-.sock"
-    )
-    max_name_bytes = min(64, 103 - len(os.fsencode(socket_base)))
-    fixed_bytes = len(_NATIVE_SESSION_PREFIX) + len(suffix)
-    if max_name_bytes < fixed_bytes:
-        raise ValueError(
-            "The default Browser Use runtime path exceeds the macOS AF_UNIX budget."
-        )
-    generation_budget = max_name_bytes - fixed_bytes - 1
-    generation = re.sub(r"[^A-Za-z0-9_-]", "_", runtime_generation)[
-        : max(0, generation_budget)
-    ]
-    if not generation:
-        return f"{_NATIVE_SESSION_PREFIX}{suffix}"
-    return f"{_NATIVE_SESSION_PREFIX}{generation}_{suffix}"
 
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
@@ -205,22 +163,15 @@ def _floor_subprocess_path(path: str) -> str:
     return os.pathsep.join(parts)
 
 
-def _read_browser_cfg(*, fail_closed: bool = False) -> dict:
-    """Return ``browser:`` config, optionally surfacing read failures."""
+def _read_browser_cfg() -> dict:
+    """Return the ``browser:`` config section, or {} on any failure."""
     try:
-        from hermes_cli.config import cfg_get, read_raw_config, read_raw_config_strict
+        from hermes_cli.config import cfg_get, read_raw_config
 
-        raw = read_raw_config_strict() if fail_closed else read_raw_config()
-        cfg = cfg_get(raw, "browser", default={})
-        if isinstance(cfg, dict):
-            return cfg
-        if fail_closed:
-            raise ValueError("Browser configuration must be a mapping")
-        return {}
+        cfg = cfg_get(read_raw_config(), "browser", default={})
+        return cfg if isinstance(cfg, dict) else {}
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)
-        if fail_closed:
-            raise
         return {}
 
 
@@ -270,15 +221,10 @@ def is_browser_use_cli_mode() -> bool:
     Set ``browser.backend: off`` (or ``/browser use off``) for the built-in
     browser_* tools.
 
-    Camofox normally falls back to the built-in tools regardless of
+    Camofox always falls back to the built-in tools regardless of
     ``browser.backend`` — it is Firefox-based with a custom HTTP API and no
     CDP surface, so the CDP-only browser-use harness cannot drive it.
     """
-    # Native intent owns the exposed surface even under a conflicting stale
-    # selector. Execution validates the conflict and fails closed rather than
-    # silently exposing a different browser integration.
-    if _native_real_profile_enabled():
-        return True
     try:
         from tools.browser_camofox import is_camofox_mode
 
@@ -664,16 +610,6 @@ def _real_profile_consented() -> bool:
         return False
 
 
-def _native_real_profile_enabled() -> bool:
-    """Read the active profile's default-off native selection flag."""
-    try:
-        return is_truthy_value(
-            _read_browser_cfg().get("real_profile_macos_native"), default=False
-        )
-    except Exception:
-        return False
-
-
 def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     """Point the harness at the user's real-profile copy-browser when consented.
 
@@ -738,200 +674,6 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return None
 
 
-_NATIVE_ENV_FORBIDDEN = frozenset(
-    {
-        "BU_CDP_URL",
-        "BU_CDP_WS",
-        "BROWSER_CDP_URL",
-        "BU_AUTOSPAWN",
-        "BROWSER_USE_API_KEY",
-        "BROWSERBASE_API_KEY",
-        "FIRECRAWL_API_KEY",
-        "CAMOFOX_URL",
-        "AGENT_BROWSER_ENGINE",
-        _NATIVE_BROWSER_SENTINEL,
-        _PRIVATE_BROWSER_SENTINEL,
-    }
-)
-_NATIVE_ENV_ALLOWLIST = frozenset(
-    {
-        "PATH",
-        "HOME",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TERM",
-        "PYTHONUTF8",
-        "NO_COLOR",
-        "FORCE_COLOR",
-    }
-)
-
-
-def _native_subprocess_env() -> dict[str, str]:
-    """Build the native Browser Use child env without browser-stack coupling."""
-    from tools.environments.local import hermes_subprocess_env
-
-    inherited = hermes_subprocess_env(inherit_credentials=False)
-    env = {
-        key: value
-        for key, value in inherited.items()
-        if key in _NATIVE_ENV_ALLOWLIST
-    }
-    for key in _NATIVE_ENV_FORBIDDEN:
-        env.pop(key, None)
-    env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
-    env.setdefault("ANONYMIZED_TELEMETRY", "false")
-    return env
-
-
-def _native_profile_state_present() -> bool:
-    """Whether this profile has durable or copied native browser state."""
-    from hermes_constants import get_hermes_home
-
-    state_root = get_hermes_home() / "browser-supervisor" / "native-real-profile"
-    return os.path.lexists(state_root / "snapshot") or os.path.lexists(
-        state_root / "runtime.json"
-    )
-
-
-def _cleanup_revoked_native_profile(browser_config: Mapping[str, object]) -> str | None:
-    """Delete copied native credentials before any post-revocation launch."""
-    from hermes_cli.native_real_profile import NativeProfileSupervisor
-
-    state_present = _native_profile_state_present()
-    real_profile_enabled = is_truthy_value(
-        browser_config.get("use_real_profile"), default=False
-    )
-    native_enabled = is_truthy_value(
-        browser_config.get("real_profile_macos_native"), default=False
-    )
-    if real_profile_enabled and (native_enabled or not state_present):
-        return None
-    if not native_enabled and not state_present:
-        return None
-    try:
-        NativeProfileSupervisor.for_profile().cleanup(delete_snapshot=True)
-    except Exception as exc:
-        code_value = getattr(exc, "code", "native_cleanup_failed")
-        return (
-            "Native real-profile mode is off or consent is revoked, and copied "
-            "credentials could not be cleaned "
-            f"safely [{code_value}]: {exc}"
-        )
-    return (
-        "Native real-profile mode is off or consent is revoked. Copied credentials were removed; "
-        "start a new session before using another browser route."
-    )
-
-
-def _browser_exec_native(
-    *,
-    code: str,
-    session: str,
-    timeout_s: int,
-    task_id: Optional[str],
-    browser_config: dict,
-):
-    """Execute only through the generation-bound native supervisor lane."""
-    from hermes_cli.native_real_profile import NativeProfileSupervisor, native_intent
-    from tools.registry import tool_error, tool_result
-
-    if session.startswith(_NATIVE_SESSION_PREFIX):
-        return tool_error("The requested session name uses a reserved native prefix.")
-    ambient_env = dict(os.environ)
-    try:
-        import platform
-
-        native_intent(browser_config, ambient_env, system=platform.system())
-    except Exception as exc:
-        code_value = getattr(exc, "code", "native_launch_failed")
-        return tool_error(f"Native real-profile launch failed [{code_value}]: {exc}")
-    cmd = _find_cli()
-    if not cmd:
-        return tool_error(
-            "browser-use CLI not found on PATH, and uvx is unavailable for a "
-            "zero-install run. Install it with `uv tool install browser-use` "
-            "(or `pipx install browser-use`), then run `browser-use --doctor` "
-            "to verify the setup."
-        )
-
-    supervisor = NativeProfileSupervisor.for_profile()
-    client = None
-    workspace = _workspace_dir(task_id)
-    started = time.time()
-    try:
-        client = supervisor.acquire(browser_config, ambient_env)
-        env = _native_subprocess_env()
-        env["BU_CDP_URL"] = client.cdp_url
-        env["BU_NAME"] = _native_daemon_session_name(
-            session,
-            client.hermes_home,
-            client.runtime_namespace,
-            env.get("HOME", ""),
-        )
-        if workspace:
-            env["BH_AGENT_WORKSPACE"] = workspace
-        if session:
-            code = _OWN_TAB_PREAMBLE + code
-        try:
-            timeout = max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S))
-        except (TypeError, ValueError):
-            timeout = _DEFAULT_TIMEOUT_S
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=code,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return tool_error(
-                f"browser-use exec timed out after {timeout}s. The native "
-                "client was released; retry with a larger timeout_s or split the work."
-            )
-        except OSError as exc:
-            return tool_error(f"Failed to launch browser-use CLI: {exc}")
-    except Exception as exc:
-        code_value = getattr(exc, "code", "native_launch_failed")
-        return tool_error(f"Native real-profile launch failed [{code_value}]: {exc}")
-    finally:
-        if client is not None:
-            try:
-                supervisor.release(client)
-            except Exception as exc:
-                logger.warning("native real-profile client release failed: %s", exc)
-
-    result = {
-        "success": proc.returncode == 0,
-        "exit_code": proc.returncode,
-        "output": proc.stdout,
-    }
-    if workspace:
-        result["workspace"] = workspace
-    if session:
-        result["session"] = session
-    stderr = (proc.stderr or "").strip()
-    if stderr:
-        result["stderr"] = (
-            stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
-            if len(stderr) > _STDERR_CAP_CHARS
-            else stderr
-        )
-    screenshot = _find_screenshot(proc.stdout, started)
-    if screenshot:
-        result["screenshot_path"] = screenshot
-        native_result = _native_screenshot_result(result, screenshot)
-        if native_result is not None:
-            return native_result
-    return tool_result(result)
-
-
 def browser_exec(
     code: str,
     session: str = "",
@@ -949,35 +691,6 @@ def browser_exec(
     if blocked:
         return tool_error(blocked)
 
-    if session and not _SESSION_RE.match(session):
-        return tool_error(
-            f"Invalid session name {session!r}: use 1-64 letters, digits, "
-            "dashes, or underscores (e.g. 'r7k2')."
-        )
-
-    browser_config = dict(_read_browser_cfg())
-    native_selected = is_truthy_value(
-        browser_config.get("real_profile_macos_native"), default=False
-    )
-    if native_selected or _native_profile_state_present():
-        try:
-            browser_config = dict(_read_browser_cfg(fail_closed=True))
-        except Exception as exc:
-            return tool_error(f"Browser configuration is unavailable: {exc}")
-        revocation_error = _cleanup_revoked_native_profile(browser_config)
-        if revocation_error:
-            return tool_error(revocation_error)
-        if is_truthy_value(
-            browser_config.get("real_profile_macos_native"), default=False
-        ):
-            return _browser_exec_native(
-                code=code,
-                session=session,
-                timeout_s=timeout_s,
-                task_id=task_id,
-                browser_config=browser_config,
-            )
-
     cmd = _find_cli()
     if not cmd:
         return tool_error(
@@ -986,8 +699,14 @@ def browser_exec(
             "(or `pipx install browser-use`), then run `browser-use --doctor` "
             "to verify the setup."
         )
+
     env = _base_subprocess_env()
     if session:
+        if not _SESSION_RE.match(session):
+            return tool_error(
+                f"Invalid session name {session!r}: use 1-64 letters, digits, "
+                "dashes, or underscores (e.g. 'r7k2')."
+            )
         env["BU_NAME"] = session
     # Real-profile consent: on a local backend this upgrades the attach to
     # the user's default browser (profile snapshot, logins included); with

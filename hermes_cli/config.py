@@ -3362,22 +3362,6 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def read_raw_config_strict() -> Dict[str, Any]:
-    """Read raw config without converting corruption into default behavior."""
-    with _CONFIG_LOCK:
-        config_path = get_config_path()
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f)
-        except FileNotFoundError:
-            return {}
-        if data is None:
-            return {}
-        if not isinstance(data, dict):
-            raise ValueError(f"Config root in {config_path} must be a mapping")
-        return data
-
-
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
