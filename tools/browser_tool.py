@@ -1454,6 +1454,22 @@ def _use_real_profile() -> bool:
 _REAL_PROFILE_SESSION = "hermes-real-profile"
 _real_profile_cdp_lock = threading.Lock()
 _real_profile_cdp_cache: dict = {}
+_real_profile_chrome_procs: list = []
+
+
+def _terminate_real_profile_chrome() -> None:
+    """Terminate signed browsers launched directly on managed profile copies."""
+    while _real_profile_chrome_procs:
+        proc = _real_profile_chrome_procs.pop()
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        except Exception as e:
+            logger.debug("real-profile chrome terminate failed: %s", e)
 
 
 def _agent_browser_argv(browser_cmd: str) -> list:
@@ -1520,6 +1536,25 @@ def _cdp_on_data_dir(http_cdp: str, data_dir: str) -> bool:
         return False
 
 
+def _managed_profile_cdp(data_dir: str) -> Optional[str]:
+    """Return the live CDP root written by Chrome on the managed copy.
+
+    Do not probe an agent-browser session to discover this. In agent-browser
+    0.34, ``get cdp-url`` auto-launches a browser when the named session is
+    absent, which can race the signed-Chrome launch and bind the fixed session
+    name to a stale or throwaway endpoint.
+    """
+    try:
+        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
+            port = fh.readline().strip()
+    except OSError:
+        return None
+    if not port.isdigit():
+        return None
+    cdp = f"http://127.0.0.1:{port}"
+    return cdp if _cdp_http_ready(cdp) else None
+
+
 def _agent_browser_close_session(session_name: str) -> None:
     """Best-effort close of an agent-browser session (stale/wrong-dir cleanup)."""
     try:
@@ -1577,6 +1612,7 @@ def _launch_darwin_profile_copy(browser: str, copy_dir: str) -> tuple:
             start_new_session=True,
             env=_build_browser_env(),
         )
+        _real_profile_chrome_procs.append(chrome_proc)
     except (subprocess.SubprocessError, OSError) as e:
         return None, None, f"browser.use_real_profile is on, but the launch failed: {e}"
 
@@ -1689,14 +1725,10 @@ def _real_profile_cdp() -> tuple:
         # snapshot/overlay happens solely on the relaunch path below, when no
         # live browser owns the dir.
         copy_dir = real_profile_copy_dir(browser)
-        existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
-        if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
+        existing = _managed_profile_cdp(copy_dir)
+        if existing:
             _real_profile_cdp_cache["cdp"] = existing
             return existing, None
-        if existing:
-            # Stale/wrong-dir session (throwaway-temp fallback, or an old copy):
-            # close it so nothing holds the dir open before we overlay + relaunch.
-            _agent_browser_close_session(_REAL_PROFILE_SESSION)
 
         # No live browser owns the dir now — safe to (re)snapshot + overlay.
         snap_dir, err = snapshot_real_profile(browser)
@@ -1749,16 +1781,18 @@ def _real_profile_cdp() -> tuple:
             )
 
         if direct_port is not None:
+            attach_session = f"{_REAL_PROFILE_SESSION}-{direct_port}"
             argv = [
                 *_agent_browser_argv(browser_cmd),
-                "--session", _REAL_PROFILE_SESSION,
+                "--session", attach_session,
                 "--cdp", direct_port,
                 "open", "about:blank",
             ]
         else:
+            attach_session = f"{_REAL_PROFILE_SESSION}-{os.getpid()}"
             argv = [
                 *_agent_browser_argv(browser_cmd),
-                "--session", _REAL_PROFILE_SESSION,
+                "--session", attach_session,
                 "--profile", copy_dir,
                 "open", "about:blank",
             ]
@@ -1790,7 +1824,7 @@ def _real_profile_cdp() -> tuple:
                 f"failed to start: {reason}"
             )
 
-        reported_cdp = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
+        reported_cdp = _agent_browser_get_cdp(attach_session)
         if direct_port is not None:
             from urllib.parse import urlparse
 
@@ -2228,6 +2262,12 @@ def _emergency_cleanup_all_sessions():
     if _cleanup_done:
         return
     _cleanup_done = True
+
+    # Clean up directly launched signed Chrome before its attached clients.
+    try:
+        _terminate_real_profile_chrome()
+    except Exception as e:
+        logger.debug("Real-profile chrome cleanup on exit failed: %s", e)
 
     # Clean up this process's own sessions first, so their owner_pid files
     # are removed before the reaper scans.
