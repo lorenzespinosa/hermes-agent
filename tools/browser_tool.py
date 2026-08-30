@@ -1535,6 +1535,72 @@ def _agent_browser_close_session(session_name: str) -> None:
         logger.debug("real-profile session close failed: %s", e)
 
 
+def _launch_darwin_profile_copy(browser: str, copy_dir: str) -> tuple:
+    """Launch signed macOS Chromium on the managed copy and return its CDP port."""
+    from hermes_cli.browser_connect import chromium_executable
+
+    real_binary = chromium_executable(browser, "Darwin")
+    if real_binary is None:
+        return None, None, (
+            "browser.use_real_profile is on, but the installed browser binary "
+            f"for '{browser}' could not be found."
+        )
+
+    port_file = os.path.join(copy_dir, "DevToolsActivePort")
+    try:
+        os.unlink(port_file)
+    except OSError:
+        pass
+
+    argv = [
+        real_binary,
+        f"--user-data-dir={copy_dir}",
+        "--remote-debugging-port=0",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-hang-monitor",
+        "--disable-popup-blocking",
+        "--disable-prompt-on-repost",
+        "--disable-sync",
+        "--disable-features=Translate",
+        "--no-startup-window",
+    ]
+    try:
+        chrome_proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_build_browser_env(),
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return None, None, f"browser.use_real_profile is on, but the launch failed: {e}"
+
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        try:
+            with open(port_file, encoding="utf-8") as fh:
+                port = fh.readline().strip()
+            if port.isdigit():
+                return port, chrome_proc, None
+        except OSError:
+            pass
+        if chrome_proc.poll() is not None:
+            return None, chrome_proc, (
+                "browser.use_real_profile is on, but Chrome exited during startup."
+            )
+        time.sleep(0.25)
+
+    return None, chrome_proc, (
+        "browser.use_real_profile is on, but the real-profile browser did not "
+        "expose a debug port in time."
+    )
+
+
 def _real_profile_cdp() -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
@@ -1651,29 +1717,52 @@ def _real_profile_cdp() -> tuple:
             return None, f"browser.use_real_profile is on, but {err}"
         copy_dir = snap_dir
 
-        # Launch agent-browser's packaged Chromium on the profile COPY. This is
-        # the same launch path Hermes' built-in local browsing already uses,
-        # just pointed at the copied user-data-dir — no bespoke Chrome launch.
+        # macOS cookie encryption is tied to the signed browser/keychain path.
+        # agent-browser's packaged launch injects mock-keychain/basic-password
+        # flags, so it cannot decrypt a copied stable-Chrome cookie jar.  Only
+        # Darwin needs the direct signed-browser launch; other platforms keep
+        # the existing packaged-Chromium path unchanged.
+        import platform
+
+        chrome_proc = None
+        direct_port = None
+        if platform.system() == "Darwin":
+            direct_port, chrome_proc, launch_err = _launch_darwin_profile_copy(
+                browser, copy_dir
+            )
+            if launch_err or not direct_port:
+                if chrome_proc is not None:
+                    try:
+                        chrome_proc.terminate()
+                    except OSError:
+                        pass
+                return None, launch_err
+
         try:
             browser_cmd = _find_agent_browser()
         except FileNotFoundError as e:
+            if chrome_proc is not None:
+                chrome_proc.terminate()
             return None, (
                 "browser.use_real_profile is on, but the local browser engine "
                 f"(agent-browser) is not installed: {e}"
             )
-        argv = [
-            *_agent_browser_argv(browser_cmd),
-            "--session", _REAL_PROFILE_SESSION,
-            "--profile", copy_dir,
-        ]
-        # Do NOT pass agent-browser's ``--headless``: it maps to Chrome's legacy
-        # headless mode, which uses a SEPARATE cookie store and loads none of the
-        # copied profile's cookies (verified: --headless → 0 cookies, default →
-        # full jar). agent-browser's default already runs windowless on a
-        # server (no DISPLAY) while reading the real cookie store, which is
-        # exactly what real-profile browsing needs. Headed mode is a superset
-        # (visible window) and equally fine, so no flag either way.
-        argv += ["open", "about:blank"]
+
+        if direct_port is not None:
+            argv = [
+                *_agent_browser_argv(browser_cmd),
+                "--session", _REAL_PROFILE_SESSION,
+                "--cdp", direct_port,
+                "open", "about:blank",
+            ]
+        else:
+            argv = [
+                *_agent_browser_argv(browser_cmd),
+                "--session", _REAL_PROFILE_SESSION,
+                "--profile", copy_dir,
+                "open", "about:blank",
+            ]
+
         try:
             proc = subprocess.run(
                 argv, capture_output=True, text=True,
@@ -1681,13 +1770,19 @@ def _real_profile_cdp() -> tuple:
                 env=_build_browser_env(),
             )
         except subprocess.TimeoutExpired:
+            if chrome_proc is not None:
+                chrome_proc.terminate()
             return None, (
                 "browser.use_real_profile is on, but the real-profile browser "
                 "took too long to start. Retry, or turn the toggle off."
             )
         except (subprocess.SubprocessError, OSError) as e:
+            if chrome_proc is not None:
+                chrome_proc.terminate()
             return None, f"browser.use_real_profile is on, but the launch failed: {e}"
         if proc.returncode != 0:
+            if chrome_proc is not None:
+                chrome_proc.terminate()
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()
             reason = tail[-1] if tail else f"exit {proc.returncode}"
             return None, (
@@ -1695,8 +1790,15 @@ def _real_profile_cdp() -> tuple:
                 f"failed to start: {reason}"
             )
 
-        cdp = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
+        reported_cdp = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
+        cdp = (
+            f"http://127.0.0.1:{direct_port}"
+            if direct_port is not None
+            else reported_cdp
+        )
         if not cdp:
+            if chrome_proc is not None:
+                chrome_proc.terminate()
             return None, (
                 "browser.use_real_profile is on, but the real-profile browser "
                 "started without exposing a devtools endpoint. Retry, or turn "
