@@ -1791,11 +1791,30 @@ def _real_profile_cdp() -> tuple:
             )
 
         reported_cdp = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
-        cdp = (
-            f"http://127.0.0.1:{direct_port}"
-            if direct_port is not None
-            else reported_cdp
-        )
+        if direct_port is not None:
+            from urllib.parse import urlparse
+
+            try:
+                reported = urlparse(reported_cdp or "")
+                attached = (
+                    reported.hostname in {"127.0.0.1", "localhost", "::1"}
+                    and reported.port == int(direct_port)
+                )
+            except (TypeError, ValueError):
+                attached = False
+            if not attached:
+                if chrome_proc is not None:
+                    try:
+                        chrome_proc.terminate()
+                    except OSError:
+                        pass
+                return None, (
+                    "browser.use_real_profile is on, but agent-browser did not "
+                    "attach to the signed browser's devtools endpoint."
+                )
+            cdp = f"http://127.0.0.1:{direct_port}"
+        else:
+            cdp = reported_cdp
         if not cdp:
             if chrome_proc is not None:
                 chrome_proc.terminate()
