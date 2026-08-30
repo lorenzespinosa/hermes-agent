@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -575,13 +576,28 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     """
     os.makedirs(os.path.dirname(dst_file), exist_ok=True)
     if os.path.basename(src_file) in _SQLITE_AUTH_DBS:
+        wal_file = f"{src_file}-wal"
+        try:
+            has_wal = os.path.getsize(wal_file) > 0
+        except OSError:
+            has_wal = False
+
+        # A normal read-only connection includes committed WAL rows, but on a
+        # live macOS Chrome database it can block in lock negotiation beyond
+        # SQLite's busy timeout. Run that backup out of process so the launch
+        # has a real deadline. If a WAL exists, fail closed on timeout rather
+        # than silently taking an immutable snapshot that omits committed rows.
+        if has_wal:
+            return _copy_sqlite_backup_bounded(src_file, dst_file)
+
+        # With no WAL, immutable mode is both complete and immune to the macOS
+        # lock hang. Keep a bounded ordinary backup as a portability fallback.
         try:
             import sqlite3
 
-            # Read-only URI + immutable-free: we want a consistent committed
-            # snapshot, not to fight the writer. Short busy timeout so a truly
-            # wedged DB fails fast rather than hanging the launch.
-            source = sqlite3.connect(f"file:{src_file}?mode=ro", uri=True, timeout=5)
+            source = sqlite3.connect(
+                f"file:{src_file}?mode=ro&immutable=1", uri=True, timeout=5
+            )
             try:
                 out = sqlite3.connect(dst_file)
                 try:
@@ -593,8 +609,14 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
                 source.close()
             return True
         except Exception as e:
-            logger.debug("real-profile: sqlite-backup of %s failed (%s); trying raw copy",
-                         src_file, e)
+            logger.debug(
+                "real-profile: immutable sqlite-backup of %s failed (%s); "
+                "trying bounded read-only mode",
+                src_file,
+                e,
+            )
+        if _copy_sqlite_backup_bounded(src_file, dst_file):
+            return True
     # Non-DB file, or DB whose backup failed: raw copy.
     try:
         shutil.copy2(src_file, dst_file)
@@ -602,6 +624,47 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     except OSError as e:
         logger.debug("real-profile: could not copy %s: %s", src_file, e)
         return False
+
+
+def _copy_sqlite_backup_bounded(src_file: str, dst_file: str) -> bool:
+    """Run a WAL-aware SQLite backup with a hard process-level deadline."""
+    script = (
+        "import sqlite3,sys;"
+        "s=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=5);"
+        "d=sqlite3.connect(sys.argv[2]);"
+        "s.backup(d);d.close();s.close()"
+    )
+    try:
+        os.unlink(dst_file)
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script, src_file, dst_file],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug("real-profile: bounded sqlite-backup of %s failed: %s", src_file, e)
+        try:
+            os.unlink(dst_file)
+        except OSError:
+            pass
+        return False
+    if proc.returncode == 0:
+        return True
+    logger.debug(
+        "real-profile: bounded sqlite-backup of %s exited %s: %s",
+        src_file,
+        proc.returncode,
+        (proc.stderr or proc.stdout or "").strip(),
+    )
+    try:
+        os.unlink(dst_file)
+    except OSError:
+        pass
+    return False
 
 
 def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> int:
@@ -779,6 +842,29 @@ def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool
     )
 
 
+def _normalize_snapshot_local_state(path: str, source_profile: str) -> None:
+    """Make the managed copy select the auth profile mirrored into Default."""
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        profile = state.get("profile")
+        if not isinstance(profile, dict):
+            return
+        info_cache = profile.get("info_cache")
+        if isinstance(info_cache, dict):
+            source_identity = info_cache.get(source_profile) or info_cache.get("Default")
+            if source_identity is not None:
+                profile["info_cache"] = {"Default": source_identity}
+        profile["last_used"] = "Default"
+        profile["last_active_profiles"] = ["Default"]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except (OSError, ValueError, AttributeError) as e:
+        logger.debug("real-profile snapshot: could not normalize Local State: %s", e)
+
+
 def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
     """Snapshot ``browser``'s real ACTIVE profile into the hermes copy dir.
 
@@ -855,9 +941,11 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
         # Base user-data-dir file the browser reads at startup. Cheap; always
         # re-synced so last_used etc. stay current.
         ls_src = os.path.join(src, "Local State")
+        ls_dst = os.path.join(dst, "Local State")
         if os.path.isfile(ls_src):
             try:
-                shutil.copy2(ls_src, os.path.join(dst, "Local State"))
+                shutil.copy2(ls_src, ls_dst)
+                _normalize_snapshot_local_state(ls_dst, source_profile)
             except OSError as e:
                 logger.debug("real-profile snapshot: skipped Local State: %s", e)
 
