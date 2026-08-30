@@ -148,6 +148,24 @@ class TestSnapshotRealProfile:
             "Default": {"name": "Work", "user_name": "work@example.com"}
         }
 
+    def test_snapshot_fails_closed_when_local_state_cannot_be_normalized(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.browser_connect as bc
+
+        src = self._make_profile(tmp_path / "real")
+        (src / "Local State").write_text("{not-json")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+
+        assert dst is None
+        assert err and "Local State" in err and "normalize" in err
+        assert not (
+            home / "browser-profile" / "chrome" / ".hermes-snapshot-complete"
+        ).exists()
+
     def test_sqlite_auth_copy_includes_committed_wal_rows(self, tmp_path):
         import sqlite3
 
@@ -333,6 +351,44 @@ class TestRealProfileCdpLaunch:
         agent_argv = captured["agent_browser_argv"]
         assert "--cdp" in agent_argv and "41000" in agent_argv
         assert "--profile" not in agent_argv
+        self._reset()
+
+    @pytest.mark.parametrize(
+        "reported_cdp", [None, "http://127.0.0.1:42000"]
+    )
+    def test_darwin_fails_closed_when_agent_browser_attach_is_unverified(
+        self, tmp_path, reported_cdp
+    ):
+        import tools.browser_tool as bt
+
+        self._reset()
+        chrome_proc = MagicMock()
+        chrome_proc.poll.return_value = None
+
+        def fake_popen(argv, **kwargs):
+            (tmp_path / "DevToolsActivePort").write_text(
+                "41000\n/devtools/browser/hermes-copy\n"
+            )
+            return chrome_proc
+
+        with patch("platform.system", return_value="Darwin"), \
+             patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), \
+             patch.object(bt, "_agent_browser_get_cdp", side_effect=[None, reported_cdp]), \
+             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(
+                 bt.subprocess,
+                 "run",
+                 return_value=Mock(returncode=0, stdout="", stderr=""),
+             ):
+            cdp, err = bt._real_profile_cdp()
+
+        assert cdp is None
+        assert err and "attach" in err.lower()
+        chrome_proc.terminate.assert_called_once_with()
         self._reset()
 
     def test_darwin_launch_error_terminates_spawned_browser(self, tmp_path):

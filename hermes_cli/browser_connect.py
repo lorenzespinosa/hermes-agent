@@ -842,16 +842,19 @@ def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool
     )
 
 
-def _normalize_snapshot_local_state(path: str, source_profile: str) -> None:
-    """Make the managed copy select the auth profile mirrored into Default."""
+def _normalize_snapshot_local_state(path: str, source_profile: str) -> bool:
+    """Make the managed copy select Default; report whether it was persisted."""
     import json
 
     try:
         with open(path, encoding="utf-8") as fh:
             state = json.load(fh)
         profile = state.get("profile")
-        if not isinstance(profile, dict):
-            return
+        if profile is None:
+            profile = {}
+            state["profile"] = profile
+        elif not isinstance(profile, dict):
+            return False
         info_cache = profile.get("info_cache")
         if isinstance(info_cache, dict):
             source_identity = info_cache.get(source_profile) or info_cache.get("Default")
@@ -861,8 +864,10 @@ def _normalize_snapshot_local_state(path: str, source_profile: str) -> None:
         profile["last_active_profiles"] = ["Default"]
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(state, fh)
+        return True
     except (OSError, ValueError, AttributeError) as e:
         logger.debug("real-profile snapshot: could not normalize Local State: %s", e)
+        return False
 
 
 def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
@@ -945,9 +950,14 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
         if os.path.isfile(ls_src):
             try:
                 shutil.copy2(ls_src, ls_dst)
-                _normalize_snapshot_local_state(ls_dst, source_profile)
+                if not _normalize_snapshot_local_state(ls_dst, source_profile):
+                    return None, (
+                        "could not normalize the copied Local State for the "
+                        "managed browser profile; refusing to launch a "
+                        "potentially wrong or signed-out profile."
+                    )
             except OSError as e:
-                logger.debug("real-profile snapshot: skipped Local State: %s", e)
+                return None, f"could not copy Local State into the managed profile: {e}"
 
         if not populated:
             # Fresh (or torn-and-rebuilding): drop any partial Default and copy
